@@ -966,7 +966,7 @@ impl<'a> LookupGuard<'a> {
         state.in_flight.remove(&self.uid);
         state.active = state.active.saturating_sub(1);
         self.waiter.notify_all();
-        self.gate.lookup_slot.notify_one();
+        self.gate.lookup_slot.notify_all();
     }
 }
 
@@ -977,7 +977,7 @@ impl Drop for LookupGuard<'_> {
             state.in_flight.remove(&self.uid);
             state.active = state.active.saturating_sub(1);
             self.waiter.notify_all();
-            self.gate.lookup_slot.notify_one();
+            self.gate.lookup_slot.notify_all();
         }
     }
 }
@@ -2588,5 +2588,197 @@ mod tests {
         let _seat2 = g.admit_with(&c, |_| Ok(true)).unwrap();
         assert_eq!(g.sweep_membership_with(|_| Ok(Membership::Revoked)).len(), 1);
         assert!(g.open.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn allowed_wakes_distinct_waiter_when_coalesced_waiters_drain() {
+        use std::sync::mpsc;
+
+        let wait_until_waiting = |g: &Gate, target: usize| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if g.lookup.lock().unwrap().waiting >= target {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {target} lookup_slot waiters");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Part 1: finish() path — with 4 active slots (5001..=5004), 5 waiters for
+        // 5005 and 1 waiter for 5006 sleep on lookup_slot. Draining the coalesced
+        // 5005 waiters must not leave 5006 stranded.
+        let g = gate();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let release_active = Arc::new((Mutex::new(0u32), Condvar::new()));
+        let release_5005 = Arc::new((Mutex::new(false), Condvar::new()));
+        let (u5005_started_tx, u5005_started_rx) = mpsc::channel();
+        let (u5006_done_tx, u5006_done_rx) = mpsc::channel();
+
+        let mut handles = Vec::new();
+        for uid in 5001..=5004u32 {
+            let g = g.clone();
+            let entered_tx = entered_tx.clone();
+            let release_active = release_active.clone();
+            handles.push(std::thread::spawn(move || {
+                g.allowed_with(uid, |u| {
+                    let _ = entered_tx.send(u);
+                    let (lock, cv) = &*release_active;
+                    let mut stage = lock.lock().unwrap();
+                    while *stage < if u == 5001 { 1 } else { 2 } {
+                        stage = cv.wait(stage).unwrap();
+                    }
+                    Ok(true)
+                })
+            }));
+        }
+        for _ in 0..4 {
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+
+        for _ in 0..5 {
+            let g = g.clone();
+            let release_5005 = release_5005.clone();
+            let u5005_started_tx = u5005_started_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                g.allowed_with(5005, |_| {
+                    let _ = u5005_started_tx.send(());
+                    let (lock, cv) = &*release_5005;
+                    let mut go = lock.lock().unwrap();
+                    while !*go {
+                        go = cv.wait(go).unwrap();
+                    }
+                    Ok(true)
+                })
+            }));
+        }
+        wait_until_waiting(&g, 5);
+
+        {
+            let g = g.clone();
+            let u5006_done_tx = u5006_done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let res = g.allowed_with(5006, |_| Ok(true));
+                let _ = u5006_done_tx.send(res.is_ok());
+                res
+            }));
+        }
+        wait_until_waiting(&g, 6);
+
+        {
+            let (lock, cv) = &*release_active;
+            *lock.lock().unwrap() = 1;
+            cv.notify_all();
+        }
+        u5005_started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        {
+            let (lock, cv) = &*release_active;
+            *lock.lock().unwrap() = 2;
+            cv.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (g.lookup.lock().unwrap().active > 1 || g.lookup.lock().unwrap().waiting > 2) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        {
+            let (lock, cv) = &*release_5005;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+
+        let completed = u5006_done_rx.recv_timeout(Duration::from_secs(2));
+        if completed.is_err() {
+            g.lookup_slot.notify_all();
+        }
+        assert_eq!(completed.ok(), Some(true), "distinct uid 5006 waiter must not stay stranded after coalesced waiters drain");
+        for h in handles {
+            assert!(h.join().unwrap().unwrap());
+        }
+        assert_eq!(g.lookup.lock().unwrap().waiting, 0);
+
+        // Part 2: Drop path (panic in check) also wakes distinct waiters promptly.
+        let g2 = gate();
+        let (e2_tx, e2_rx) = mpsc::channel();
+        let rel2 = Arc::new((Mutex::new(0u32), Condvar::new()));
+        let rel2_6005 = Arc::new((Mutex::new(false), Condvar::new()));
+        let (s2_tx, s2_rx) = mpsc::channel();
+        let (d2_tx, d2_rx) = mpsc::channel();
+        let mut handles2 = Vec::new();
+        for uid in 6001..=6004u32 {
+            let g2 = g2.clone();
+            let e2_tx = e2_tx.clone();
+            let rel2 = rel2.clone();
+            handles2.push(std::thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = g2.allowed_with(uid, |u| {
+                        let _ = e2_tx.send(u);
+                        {
+                            let (lock, cv) = &*rel2;
+                            let mut stage = lock.lock().unwrap();
+                            while *stage < if u == 6001 { 1 } else { 2 } {
+                                stage = cv.wait(stage).unwrap();
+                            }
+                        }
+                        panic!("simulated lookup panic");
+                    });
+                }));
+            }));
+        }
+        for _ in 0..4 {
+            e2_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        for _ in 0..5 {
+            let g2 = g2.clone();
+            let rel2_6005 = rel2_6005.clone();
+            let s2_tx = s2_tx.clone();
+            handles2.push(std::thread::spawn(move || {
+                let _ = g2.allowed_with(6005, |_| {
+                    let _ = s2_tx.send(());
+                    let (lock, cv) = &*rel2_6005;
+                    let mut go = lock.lock().unwrap();
+                    while !*go {
+                        go = cv.wait(go).unwrap();
+                    }
+                    Ok(true)
+                });
+            }));
+        }
+        wait_until_waiting(&g2, 5);
+        {
+            let g2 = g2.clone();
+            let d2_tx = d2_tx.clone();
+            handles2.push(std::thread::spawn(move || {
+                let ok = g2.allowed_with(6006, |_| Ok(true)).is_ok();
+                let _ = d2_tx.send(ok);
+            }));
+        }
+        wait_until_waiting(&g2, 6);
+        {
+            let (lock, cv) = &*rel2;
+            *lock.lock().unwrap() = 1;
+            cv.notify_all();
+        }
+        s2_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        {
+            let (lock, cv) = &*rel2;
+            *lock.lock().unwrap() = 2;
+            cv.notify_all();
+        }
+        let completed2 = d2_rx.recv_timeout(Duration::from_secs(2));
+        {
+            let (lock, cv) = &*rel2_6005;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        if completed2.is_err() {
+            g2.lookup_slot.notify_all();
+        }
+        assert_eq!(completed2.ok(), Some(true), "distinct uid 6006 waiter must wake when LookupGuard drops on panic");
+        for h in handles2 {
+            h.join().unwrap();
+        }
+        assert_eq!(g2.lookup.lock().unwrap().waiting, 0);
     }
 }
