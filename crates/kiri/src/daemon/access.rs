@@ -1002,8 +1002,10 @@ struct AclState {
     unresolved_streak: u32,
     /// Member list for which ACL writes permanently failed or exceeded limits.
     skipped_for_names: Option<Vec<CString>>,
-    /// Timestamp of the last full group/ACL refresh.
-    last_refresh: Option<Instant>,
+    /// Timestamp of the last successful `fetch_group()`.
+    last_group_fetch: Option<Instant>,
+    /// Timestamp of the last `resolve(&group)` (or skip for unchanged names).
+    last_resolve: Option<Instant>,
     /// Last observed `/etc/group` stamp so local edits trigger immediate refresh.
     etc_group_stamp: Option<FileStamp>,
     /// Avoid repeating the oversized/permanent-error warning on every tick.
@@ -1192,7 +1194,7 @@ impl Gate {
             let fast_unresolved = state.has_unresolved && state.unresolved_streak < DIRECTORY_MISS_GRACE;
             if !fast_unresolved {
                 let interval = if state.has_directory || state.has_unresolved { IDLE_DIRECTORY_REFRESH } else { IDLE_LOCAL_NSS_REFRESH };
-                if let Some(last) = state.last_refresh
+                if let Some(last) = state.last_group_fetch
                     && now.saturating_duration_since(last) < interval
                 {
                     return;
@@ -1219,6 +1221,7 @@ impl Gate {
 
         let Ok(group) = group else { return };
         state.etc_group_stamp = stamp;
+        state.last_group_fetch = Some(now);
 
         match group {
             LookupResult::NotFound => {
@@ -1227,7 +1230,6 @@ impl Gate {
                 state.has_unresolved = false;
                 state.skipped_for_names = None;
                 state.warned_skip = false;
-                state.last_refresh = Some(now);
                 if state.uids.as_deref() == Some(&[]) {
                     state.names = Some(Vec::new());
                     return;
@@ -1250,7 +1252,6 @@ impl Gate {
                 // ACL on a single transient outage; clear only after grace.
                 state.has_unresolved = true;
                 state.unresolved_streak = state.unresolved_streak.saturating_add(1);
-                state.last_refresh = Some(now);
                 let existing_nonempty = state.uids.as_ref().is_some_and(|u| !u.is_empty());
                 if existing_nonempty && state.unresolved_streak < DIRECTORY_MISS_GRACE {
                     return;
@@ -1277,7 +1278,7 @@ impl Gate {
                 let names_changed = state.names.as_ref() != Some(&now_names);
 
                 if !names_changed && state.skipped_for_names.as_ref() == Some(&now_names) {
-                    state.last_refresh = Some(now);
+                    state.last_resolve = Some(now);
                     return;
                 }
 
@@ -1285,7 +1286,7 @@ impl Gate {
                     || names_changed
                     || !closed_uids.is_empty()
                     || (state.has_unresolved && state.unresolved_streak < DIRECTORY_MISS_GRACE)
-                    || ((state.has_directory || state.has_unresolved) && state.last_refresh.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_DIRECTORY_REFRESH));
+                    || ((state.has_directory || state.has_unresolved) && state.last_resolve.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_DIRECTORY_REFRESH));
 
                 if !refresh_due {
                     return;
@@ -1299,7 +1300,7 @@ impl Gate {
                     }
                 };
 
-                state.last_refresh = Some(now);
+                state.last_resolve = Some(now);
                 state.has_directory = resolved.directory_members > 0;
                 state.has_unresolved = resolved.unresolved > 0;
 
@@ -2448,9 +2449,10 @@ mod tests {
         assert_eq!(group_fetches.load(Ordering::Relaxed), 2);
 
         // After IDLE_LOCAL_NSS_REFRESH, an idle refresh runs even without /etc/group edits.
+        let t_refresh = t0 + RECHECK * 2 + IDLE_LOCAL_NSS_REFRESH;
         g.tick_with(
             &mut state,
-            t0 + RECHECK * 2 + IDLE_LOCAL_NSS_REFRESH,
+            t_refresh,
             stamp2,
             || {
                 group_fetches.fetch_add(1, Ordering::Relaxed);
@@ -2461,6 +2463,60 @@ mod tests {
             |_| Ok(()),
         );
         assert_eq!(group_fetches.load(Ordering::Relaxed), 3);
+
+        // The next idle tick after the 30s refresh must NOT fetch again for another 30s.
+        g.tick_with(
+            &mut state,
+            t_refresh + RECHECK,
+            stamp2,
+            || {
+                group_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::Found(grp.clone()))
+            },
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 0, oversized: false }),
+            |_| Ok(()),
+        );
+        assert_eq!(group_fetches.load(Ordering::Relaxed), 3, "tick after idle refresh must not refork getent");
+
+        // Another full IDLE_LOCAL_NSS_REFRESH later, one refresh runs again.
+        g.tick_with(
+            &mut state,
+            t_refresh + IDLE_LOCAL_NSS_REFRESH,
+            stamp2,
+            || {
+                group_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::Found(grp.clone()))
+            },
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 0, oversized: false }),
+            |_| Ok(()),
+        );
+        assert_eq!(group_fetches.load(Ordering::Relaxed), 4);
+
+        // While a client stays connected, frequent group fetches must not starve
+        // periodic directory UID refreshes (IDLE_DIRECTORY_REFRESH).
+        let g_dir = gate();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let _seat = g_dir.admit_with(&a, |_| Ok(true)).unwrap();
+        let mut dir_state = AclState::default();
+        let dir_grp = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"alice".to_owned()] };
+        let dir_resolves = AtomicU64::new(0);
+        for step in 0..=3u32 {
+            g_dir.tick_with(
+                &mut dir_state,
+                t0 + RECHECK * step,
+                stamp1,
+                || Ok(LookupResult::Found(dir_grp.clone())),
+                |_, _| Ok(Membership::Allowed),
+                |_| {
+                    dir_resolves.fetch_add(1, Ordering::Relaxed);
+                    Ok(ResolvedMembers { uids: vec![5001], directory_members: 1, unresolved: 0, oversized: false })
+                },
+                |_| Ok(()),
+            );
+        }
+        assert_eq!(dir_resolves.load(Ordering::Relaxed), 2, "connected 2s ticks must still refresh directory UIDs after 6s");
     }
 
     #[test]
