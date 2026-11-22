@@ -45,8 +45,9 @@ pub fn run(args: &[String]) -> io::Result<u8> {
         must(Command::new("groupadd").args(["--system", GROUP]), "groupadd")?;
     }
     if !crate::daemon::access::members(GROUP)?.iter().any(|m| m == user) {
-        // usermod everywhere we package for; gpasswd where it isn't.
-        let added = Command::new("usermod").args(["-aG", GROUP, user]).status().is_ok_and(|s| s.success());
+        // usermod everywhere we package for; gpasswd where it isn't (and for
+        // directory accounts not in /etc/passwd, which usermod refuses).
+        let added = Command::new("usermod").args(["-aG", GROUP, user]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
         if !added {
             must(Command::new("gpasswd").args(["-a", user, GROUP]), "gpasswd")?;
         }

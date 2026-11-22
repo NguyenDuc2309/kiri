@@ -297,14 +297,19 @@ fn finder(engine: &std::sync::Arc<engine::Engine>) {
 
 /// Gives `group` read-write access to the socket.
 fn socket_group(socket: &std::path::Path, group: &std::ffi::OsStr) -> io::Result<()> {
-    let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(group)).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: getgrnam with a valid C string; the result is read at once.
-    let gid = unsafe {
-        let g = libc::getgrnam(name.as_ptr());
-        if g.is_null() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("no group {}", group.to_string_lossy())));
+    #[cfg(target_os = "linux")]
+    let gid = access::group_gid(group)?;
+    #[cfg(not(target_os = "linux"))]
+    let gid = {
+        let name = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(group)).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: getgrnam with a valid C string; the result is read at once.
+        unsafe {
+            let g = libc::getgrnam(name.as_ptr());
+            if g.is_null() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("no group {}", group.to_string_lossy())));
+            }
+            (*g).gr_gid
         }
-        (*g).gr_gid
     };
     std::os::unix::fs::chown(socket, None, Some(gid))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))

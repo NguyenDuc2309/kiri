@@ -65,6 +65,14 @@ unsafe fn nss<T>(mut call: impl FnMut(*mut T, *mut c_char, usize, *mut *mut T) -
     }
 }
 
+/// Trusted locations for `getent`: never searched through `PATH` because this
+/// code runs as root in the daemon and in `kiri host-access`.
+const GETENT_PATHS: &[&str] = &["/usr/bin/getent", "/bin/getent", "/run/current-system/sw/bin/getent"];
+
+fn find_getent() -> Option<&'static Path> {
+    GETENT_PATHS.iter().map(Path::new).find(|p| p.is_file())
+}
+
 /// An account: its name, uid and primary group.
 #[derive(Debug, PartialEq, Eq)]
 struct Account {
@@ -84,11 +92,39 @@ impl Account {
     }
 }
 
+/// A group: its name, gid and explicit member names.
+#[derive(Debug, PartialEq, Eq)]
+struct Group {
+    name: CString,
+    gid: u32,
+    members: Vec<CString>,
+}
+
+impl Group {
+    fn from_rec(g: &Rec<libc::group>) -> Option<Group> {
+        if g.rec.gr_name.is_null() {
+            return None;
+        }
+        // SAFETY: gr_name and gr_mem strings are NUL-terminated in the record's buffer.
+        let name = unsafe { CStr::from_ptr(g.rec.gr_name) }.to_owned();
+        let mut members = Vec::new();
+        let mut m = g.rec.gr_mem;
+        // SAFETY: gr_mem is a NULL-terminated array of account names for this group.
+        unsafe {
+            while !m.is_null() && !(*m).is_null() {
+                members.push(CStr::from_ptr(*m).to_owned());
+                m = m.add(1);
+            }
+        }
+        Some(Group { name, gid: g.rec.gr_gid, members })
+    }
+}
+
 fn account_by_uid(uid: u32) -> io::Result<Option<Account>> {
     // SAFETY: getpwuid_r with a passwd record and a buffer of the stated size.
     match unsafe { nss(|rec, buf, len, out| libc::getpwuid_r(uid, rec, buf, len, out)) }? {
         Some(a) => Ok(Account::from_rec(&a)),
-        None => Ok(getent(&uid.to_string())?.filter(|a| a.uid == uid)),
+        None => Ok(getent_account(uid.to_string().as_bytes())?.filter(|a| a.uid == uid)),
     }
 }
 
@@ -96,7 +132,52 @@ fn account_by_name(name: &CStr) -> io::Result<Option<Account>> {
     // SAFETY: getpwnam_r with a valid C string, a passwd record and a buffer of the stated size.
     match unsafe { nss(|rec, buf, len, out| libc::getpwnam_r(name.as_ptr(), rec, buf, len, out)) }? {
         Some(a) => Ok(Account::from_rec(&a)),
-        None => Ok(getent(&name.to_string_lossy())?.filter(|a| a.name.as_c_str() == name)),
+        None => Ok(getent_account(name.to_bytes())?.filter(|a| a.name.as_c_str() == name)),
+    }
+}
+
+fn valid_key(key: &[u8]) -> bool {
+    !key.is_empty() && key[0] != b'-' && !key.iter().any(|&b| matches!(b, b':' | b'\n' | b'\r' | 0))
+}
+
+fn single_line(text: &[u8]) -> Option<&[u8]> {
+    let line = text.strip_suffix(b"\n").unwrap_or(text);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() || line.contains(&b'\n') || line.contains(&b'\r') {
+        return None;
+    }
+    Some(line)
+}
+
+fn parse_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// Runs `program -- <db> <key>`, returning `Ok(Some(stdout))` on exit 0,
+/// `Ok(None)` on exit 2 (no such key) or missing binary, and `Err` otherwise.
+fn run_getent(program: &Path, db: &str, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    if !valid_key(key) {
+        return Ok(None);
+    }
+    let out = match std::process::Command::new(program)
+        .args(["--", db])
+        .arg(OsStr::from_bytes(key))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match out.status.code() {
+        Some(0) => Ok(Some(out.stdout)),
+        // 2: no such key.
+        Some(2) => Ok(None),
+        _ => Err(io::Error::other(format!("getent {db} {}: {}", String::from_utf8_lossy(key), out.status))),
     }
 }
 
@@ -104,63 +185,139 @@ fn account_by_name(name: &CStr) -> io::Result<Option<Account>> {
 /// LDAP, winbind, Entra ID, systemd-homed): this binary is static, so its own
 /// lookups read /etc/passwd alone and can't load the system's NSS modules
 /// (#349). `getent` uses them. Ok(None): no such account, or no getent.
-fn getent(key: &str) -> io::Result<Option<Account>> {
-    if key.is_empty() || key.starts_with('-') {
-        return Ok(None);
+fn getent_account(key: &[u8]) -> io::Result<Option<Account>> {
+    let Some(program) = find_getent() else { return Ok(None) };
+    getent_account_with(program, key)
+}
+
+fn getent_account_with(program: &Path, key: &[u8]) -> io::Result<Option<Account>> {
+    let Some(stdout) = run_getent(program, "passwd", key)? else { return Ok(None) };
+    passwd_line(&stdout)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent passwd output for {}", String::from_utf8_lossy(key))))
+}
+
+/// A group resolved through NSS when not in /etc/group.
+fn getent_group(key: &[u8]) -> io::Result<Option<Group>> {
+    let Some(program) = find_getent() else { return Ok(None) };
+    getent_group_with(program, key)
+}
+
+fn getent_group_with(program: &Path, key: &[u8]) -> io::Result<Option<Group>> {
+    let Some(stdout) = run_getent(program, "group", key)? else { return Ok(None) };
+    group_line(&stdout)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent group output for {}", String::from_utf8_lossy(key))))
+}
+
+/// Checks supplementary group memberships through NSS (`getent initgroups`),
+/// covering directory memberships that are not written into /etc/group.
+fn initgroups_has(user: &CStr, gid: u32) -> io::Result<bool> {
+    let Some(program) = find_getent() else { return Ok(false) };
+    initgroups_has_with(program, user, gid)
+}
+
+fn initgroups_has_with(program: &Path, user: &CStr, gid: u32) -> io::Result<bool> {
+    let key = user.to_bytes();
+    if !valid_key(key) {
+        return Ok(false);
     }
-    let out = match std::process::Command::new("getent").args(["passwd", key]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output() {
+    let out = match std::process::Command::new(program)
+        .args(["--", "initgroups"])
+        .arg(OsStr::from_bytes(key))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
         Ok(out) => out,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
     match out.status.code() {
-        Some(0) => Ok(passwd_line(&String::from_utf8_lossy(&out.stdout))),
-        // 2: no such key.
-        Some(2) => Ok(None),
-        _ => Err(io::Error::other(format!("getent passwd {key}: {}", out.status))),
+        Some(0) => {
+            let gids = initgroups_line(&out.stdout, key)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent initgroups output for {}", user.to_string_lossy())))?;
+            Ok(gids.contains(&gid))
+        }
+        // 1: database unknown (non-glibc getent); 2: no such key.
+        Some(1 | 2) => Ok(false),
+        _ => Err(io::Error::other(format!("getent initgroups {}: {}", user.to_string_lossy(), out.status))),
     }
 }
 
-/// `name:password:uid:gid:…`, the first line of getent's answer.
-fn passwd_line(text: &str) -> Option<Account> {
-    let mut f = text.lines().next()?.split(':');
+/// `name:password:uid:gid:gecos:dir:shell`, the single line of `getent passwd`.
+fn passwd_line(text: &[u8]) -> Option<Account> {
+    let line = single_line(text)?;
+    let mut f = line.split(|&b| b == b':');
     let name = CString::new(f.next().filter(|n| !n.is_empty())?).ok()?;
     let _password = f.next()?;
-    Some(Account { name, uid: f.next()?.parse().ok()?, gid: f.next()?.parse().ok()? })
+    let uid = parse_u32(f.next()?)?;
+    let gid = parse_u32(f.next()?)?;
+    let _gecos = f.next()?;
+    let _dir = f.next()?;
+    let _shell = f.next()?;
+    Some(Account { name, uid, gid })
 }
 
-fn group_by_name(name: &CStr) -> io::Result<Rec<libc::group>> {
+/// `name:password:gid:members`, the single line of `getent group`.
+fn group_line(text: &[u8]) -> Option<Group> {
+    let line = single_line(text)?;
+    let mut f = line.split(|&b| b == b':');
+    let name = CString::new(f.next().filter(|n| !n.is_empty())?).ok()?;
+    let _password = f.next()?;
+    let gid = parse_u32(f.next()?)?;
+    let raw_members = f.next()?;
+    if f.next().is_some() {
+        return None;
+    }
+    let mut members = Vec::new();
+    for m in raw_members.split(|&b| b == b',').filter(|m| !m.is_empty()) {
+        members.push(CString::new(m).ok()?);
+    }
+    Some(Group { name, gid, members })
+}
+
+/// `<user> [<gid> ...]`, the single line of `getent initgroups <user>`.
+fn initgroups_line(text: &[u8], expected_user: &[u8]) -> Option<Vec<u32>> {
+    let line = single_line(text)?;
+    let rest = line.strip_prefix(expected_user)?;
+    if !rest.is_empty() && !matches!(rest[0], b' ' | b'\t') {
+        return None;
+    }
+    let mut gids = Vec::new();
+    for tok in rest.split(|b| matches!(b, b' ' | b'\t')).filter(|s| !s.is_empty()) {
+        gids.push(parse_u32(tok)?);
+    }
+    Some(gids)
+}
+
+fn group_by_name(name: &CStr) -> io::Result<Group> {
     // SAFETY: getgrnam_r with a valid C string, a group record and a buffer of the stated size.
-    unsafe { nss(|rec, buf, len, out| libc::getgrnam_r(name.as_ptr(), rec, buf, len, out)) }?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no group {}", name.to_string_lossy())))
+    let group = match unsafe { nss(|rec, buf, len, out| libc::getgrnam_r(name.as_ptr(), rec, buf, len, out)) }? {
+        Some(g) => Group::from_rec(&g),
+        None => getent_group(name.to_bytes())?.filter(|g| g.name.as_c_str() == name),
+    };
+    group.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no group {}", name.to_string_lossy())))
 }
 
 fn c_name(s: &str) -> io::Result<CString> {
     CString::new(s).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-/// The account names listed in a group record.
-fn names(group: &libc::group) -> Vec<&CStr> {
-    let mut out = Vec::new();
-    let mut m = group.gr_mem;
-    // SAFETY: gr_mem is a NULL-terminated array of account names for this group.
-    unsafe {
-        while !m.is_null() && !(*m).is_null() {
-            out.push(CStr::from_ptr(*m));
-            m = m.add(1);
-        }
-    }
-    out
-}
-
 fn group_members(group: &CStr) -> io::Result<Vec<String>> {
     let g = group_by_name(group)?;
-    Ok(names(&g.rec).iter().map(|n| n.to_string_lossy().into_owned()).collect())
+    Ok(g.members.iter().map(|n| n.to_string_lossy().into_owned()).collect())
 }
 
 /// The users in `group` by name (its member list, not primary-group users).
 pub fn members(group: &str) -> io::Result<Vec<String>> {
     group_members(&c_name(group)?)
+}
+
+/// A group's numeric id.
+pub fn group_gid(group: &OsStr) -> io::Result<u32> {
+    let name = CString::new(group.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    Ok(group_by_name(&name)?.gid)
 }
 
 /// A user's numeric id, if the account exists.
@@ -171,10 +328,14 @@ pub fn uid(user: &str) -> Option<u32> {
 /// The uids of the names in a group record, sorted. A name with no account
 /// is left out; a lookup that fails fails the whole list, so a slow directory
 /// never shrinks it.
-fn uids_of(group: &libc::group) -> io::Result<Vec<u32>> {
+fn uids_of(group: &Group) -> io::Result<Vec<u32>> {
+    uids_of_with(group, account_by_name)
+}
+
+fn uids_of_with(group: &Group, lookup: impl Fn(&CStr) -> io::Result<Option<Account>>) -> io::Result<Vec<u32>> {
     let mut out = Vec::new();
-    for name in names(group) {
-        if let Some(a) = account_by_name(name)? {
+    for name in &group.members {
+        if let Some(a) = lookup(name)? {
             out.push(a.uid);
         }
     }
@@ -184,7 +345,7 @@ fn uids_of(group: &libc::group) -> io::Result<Vec<u32>> {
 }
 
 fn member_uids(group: &CStr) -> io::Result<Vec<u32>> {
-    uids_of(&group_by_name(group)?.rec)
+    uids_of(&group_by_name(group)?)
 }
 
 /// Gives every member of `group` read-write access to `socket` by name, so a
@@ -209,13 +370,13 @@ fn peer_uid(conn: &UnixStream) -> io::Result<u32> {
 }
 
 /// Whether the account is in the group by name or as its primary group.
-fn group_member(user: &CStr, primary_gid: libc::gid_t, group: &libc::group) -> bool {
-    primary_gid == group.gr_gid || names(group).contains(&user)
+fn group_member(user: &CStr, primary_gid: libc::gid_t, group: &Group) -> bool {
+    primary_gid == group.gid || group.members.iter().any(|m| m.as_c_str() == user)
 }
 
 /// The group's record, or `None` if the group was deleted: that leaves
 /// nobody in it, which is an answer, not a failure.
-fn current(group: &CStr) -> io::Result<Option<Rec<libc::group>>> {
+fn current(group: &CStr) -> io::Result<Option<Group>> {
     match group_by_name(group) {
         Ok(g) => Ok(Some(g)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -224,14 +385,26 @@ fn current(group: &CStr) -> io::Result<Option<Rec<libc::group>>> {
 }
 
 /// Whether the account `uid` is in the group now. No account, or no group: no.
-fn member_of(uid: u32, group: Option<&libc::group>) -> io::Result<bool> {
+fn member_of(uid: u32, group: Option<&Group>) -> io::Result<bool> {
+    member_of_with(uid, group, account_by_uid, initgroups_has)
+}
+
+fn member_of_with(
+    uid: u32,
+    group: Option<&Group>,
+    lookup: impl Fn(u32) -> io::Result<Option<Account>>,
+    initgroups: impl Fn(&CStr, u32) -> io::Result<bool>,
+) -> io::Result<bool> {
     let Some(group) = group else { return Ok(false) };
-    let Some(a) = account_by_uid(uid)? else { return Ok(false) };
-    Ok(group_member(&a.name, a.gid, group))
+    let Some(a) = lookup(uid)? else { return Ok(false) };
+    if group_member(&a.name, a.gid, group) {
+        return Ok(true);
+    }
+    initgroups(&a.name, group.gid)
 }
 
 fn member(uid: u32, group: &CStr) -> io::Result<bool> {
-    member_of(uid, current(group)?.as_ref().map(|g| &g.rec))
+    member_of(uid, current(group)?.as_ref())
 }
 
 /// Who may use the engine's socket: root, the account the daemon runs as, and
@@ -301,23 +474,26 @@ impl Gate {
         let group = current(&self.group);
         let connected = !self.open.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         if connected {
-            self.sweep_with(|uid| {
+            let closed = self.sweep_with(|uid| {
                 if uid == 0 || uid == self.owner {
                     return Ok(true);
                 }
                 let g = group.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
-                let yes = member_of(uid, g.as_ref().map(|g| &g.rec))?;
+                let yes = member_of(uid, g.as_ref())?;
                 self.remember(uid, yes);
                 Ok(yes)
             });
+            if closed > 0 {
+                *listed = None;
+            }
         }
         let Ok(group) = group else { return };
-        let now: Vec<CString> = group.as_ref().map(|g| names(&g.rec).into_iter().map(CStr::to_owned).collect()).unwrap_or_default();
+        let now: Vec<CString> = group.as_ref().map(|g| g.members.clone()).unwrap_or_default();
         if listed.as_ref() == Some(&now) {
             return;
         }
         // Only a list actually written counts: anything else is tried again.
-        let written = group.as_ref().map_or(Ok(Vec::new()), |g| uids_of(&g.rec)).and_then(|uids| self.set_all(&uids).map(|()| uids.len()));
+        let written = group.as_ref().map_or(Ok(Vec::new()), uids_of).and_then(|uids| self.set_all(&uids).map(|()| uids.len()));
         match written {
             Ok(n) => {
                 crate::diag::info!("socket access list written", members = n);
@@ -518,15 +694,8 @@ mod tests {
 
     #[test]
     fn membership_includes_names_and_primary_group() {
-        let alice = c"alice";
-        let mut names = [alice.as_ptr().cast_mut(), std::ptr::null_mut()];
-        let group = libc::group {
-            gr_name: c"kiri".as_ptr().cast_mut(),
-            gr_passwd: c"x".as_ptr().cast_mut(),
-            gr_gid: 100,
-            gr_mem: names.as_mut_ptr(),
-        };
-        assert!(group_member(alice, 1, &group));
+        let group = Group { name: c"kiri".to_owned(), gid: 100, members: vec![c"alice".to_owned()] };
+        assert!(group_member(c"alice", 1, &group));
         assert!(group_member(c"bob", 100, &group));
         assert!(!group_member(c"bob", 1, &group));
     }
@@ -754,13 +923,171 @@ mod tests {
     #[test]
     fn getent_lines_read_as_accounts() {
         let alice = Account { name: c"alice".to_owned(), uid: 5001, gid: 5001 };
-        assert_eq!(passwd_line("alice:x:5001:5001:Directory user:/home/alice:/bin/bash\n"), Some(alice));
-        assert_eq!(passwd_line("alice@corp.example:*:1916400001:1916400001::/home/alice:/bin/sh").map(|a| a.uid), Some(1_916_400_001));
-        for bad in ["", "\n", ":x:1:1::/:/bin/sh", "alice:x:one:1::/:/bin/sh", "alice:x:1"] {
+        assert_eq!(passwd_line(b"alice:x:5001:5001:Directory user:/home/alice:/bin/bash\n"), Some(alice));
+        assert_eq!(passwd_line(b"alice@corp.example:*:1916400001:1916400001::/home/alice:/bin/sh").map(|a| a.uid), Some(1_916_400_001));
+        assert_eq!(passwd_line(b"CORP\\alice:x:5002:5002:Room: 101:/home/alice:/bin/sh").map(|a| a.uid), Some(5002));
+        for bad in [
+            &b""[..],
+            b"\n",
+            b":x:1:1::/:/bin/sh",
+            b"alice:x:one:1::/:/bin/sh",
+            b"alice:x:+5001:5001::/:/bin/sh",
+            b"alice:x:1",
+            b"alice:x:1:1",
+            b"alice:x:5001:5001::/:/bin/sh\nbob:x:5002:5002::/:/bin/sh\n",
+        ] {
             assert_eq!(passwd_line(bad), None, "{bad:?}");
         }
-        // Never an option to getent.
-        assert_eq!(getent("--help").unwrap(), None);
-        assert_eq!(getent("").unwrap(), None);
+        // Never an option or delimiter to getent.
+        for bad_key in [&b""[..], b"--help", b"-s", b"alice:x", b"alice\nbob"] {
+            assert_eq!(getent_account(bad_key).unwrap(), None, "{bad_key:?}");
+            assert_eq!(getent_group(bad_key).unwrap(), None, "{bad_key:?}");
+        }
+    }
+
+    #[test]
+    fn getent_lines_read_as_groups() {
+        let g = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"alice".to_owned(), c"bob@corp.example".to_owned()] };
+        assert_eq!(group_line(b"kiri:x:998:alice,bob@corp.example\n"), Some(g));
+        assert_eq!(group_line(b"kiri:x:998:\n"), Some(Group { name: c"kiri".to_owned(), gid: 998, members: vec![] }));
+        for bad in [
+            &b""[..],
+            b"\n",
+            b":x:998:alice",
+            b"kiri:x:abc:alice",
+            b"kiri:x:+998:alice",
+            b"kiri:x:998",
+            b"kiri:x:998:alice:extra",
+            b"kiri:x:998:alice\nother:x:999:bob\n",
+        ] {
+            assert_eq!(group_line(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn getent_initgroups_lines_match_exact_user_and_gids() {
+        assert_eq!(initgroups_line(b"alice                 65200 1002\n", b"alice"), Some(vec![65200, 1002]));
+        assert_eq!(initgroups_line(b"alice\t998\n", b"alice"), Some(vec![998]));
+        assert_eq!(initgroups_line(b"alice                 \n", b"alice"), Some(vec![]));
+        assert_eq!(initgroups_line(b"alice\n", b"alice"), Some(vec![]));
+        assert_eq!(initgroups_line(b"alice@corp.example 998 44\n", b"alice@corp.example"), Some(vec![998, 44]));
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"alice2 998\n",
+            b"bob 998\n",
+            b"alice 998 bad\n",
+            b"alice +998\n",
+            b"alice 998\nbob 999\n",
+        ] {
+            assert_eq!(initgroups_line(bad, b"alice"), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn getent_process_handles_status_codes_and_invalid_keys() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kiri-getent-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prog = dir.join("fake-getent");
+        let touched = dir.join("touched");
+        let script = format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = \"--\" ] || exit 9\n\
+             shift\n\
+             db=\"$1\"; key=\"$2\"\n\
+             case \"$key\" in -*) echo bad > \"{}\"; exit 9 ;; esac\n\
+             case \"$db:$key\" in\n\
+               passwd:alice) echo 'alice:x:5001:5001:Alice:/home/alice:/bin/sh'; exit 0 ;;\n\
+               passwd:5001) echo 'alice:x:5001:5001:Alice:/home/alice:/bin/sh'; exit 0 ;;\n\
+               passwd:0) echo 'root:x:0:0:root:/root:/bin/sh'; exit 0 ;;\n\
+               passwd:badline) echo 'not-a-passwd-line'; exit 0 ;;\n\
+               passwd:err) exit 3 ;;\n\
+               group:dirkiri) echo 'dirkiri:x:65200:alice,localbob'; exit 0 ;;\n\
+               group:badline) echo 'bad:group'; exit 0 ;;\n\
+               group:err) exit 1 ;;\n\
+               initgroups:alice) echo 'alice                 65200 1002'; exit 0 ;;\n\
+               initgroups:outsider) echo 'outsider              2000'; exit 0 ;;\n\
+               initgroups:unsupported) exit 1 ;;\n\
+               initgroups:badline) echo 'alice2 1002'; exit 0 ;;\n\
+               initgroups:err) exit 3 ;;\n\
+               *) exit 2 ;;\n\
+             esac\n",
+            touched.display()
+        );
+        std::fs::write(&prog, script).unwrap();
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let alice = Account { name: c"alice".to_owned(), uid: 5001, gid: 5001 };
+        assert_eq!(getent_account_with(&prog, b"alice").unwrap(), Some(alice));
+        assert_eq!(getent_account_with(&prog, b"missing").unwrap(), None);
+        assert_eq!(getent_account_with(&prog, b"badline").unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(getent_account_with(&prog, b"err").is_err());
+        // Numeric username returning a different account name is rejected by the caller's exact check.
+        assert_eq!(getent_account_with(&prog, b"0").unwrap().filter(|a| a.name.as_c_str() == c"0"), None);
+
+        let dirkiri = Group { name: c"dirkiri".to_owned(), gid: 65200, members: vec![c"alice".to_owned(), c"localbob".to_owned()] };
+        assert_eq!(getent_group_with(&prog, b"dirkiri").unwrap(), Some(dirkiri));
+        assert_eq!(getent_group_with(&prog, b"missing").unwrap(), None);
+        assert_eq!(getent_group_with(&prog, b"badline").unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(getent_group_with(&prog, b"err").is_err());
+
+        assert!(initgroups_has_with(&prog, c"alice", 1002).unwrap());
+        assert!(!initgroups_has_with(&prog, c"alice", 9999).unwrap());
+        assert!(!initgroups_has_with(&prog, c"outsider", 1002).unwrap());
+        assert!(!initgroups_has_with(&prog, c"unsupported", 1002).unwrap());
+        assert!(!initgroups_has_with(&prog, c"missing", 1002).unwrap());
+        assert_eq!(initgroups_has_with(&prog, c"badline", 1002).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(initgroups_has_with(&prog, c"err", 1002).is_err());
+
+        // Option-like keys never invoke the helper.
+        assert_eq!(getent_account_with(&prog, b"-s").unwrap(), None);
+        assert_eq!(getent_group_with(&prog, b"--help").unwrap(), None);
+        assert!(!initgroups_has_with(&prog, c"-s", 1002).unwrap());
+        assert!(!touched.exists());
+
+        // Missing binary counts as no entry rather than an error.
+        let missing = dir.join("no-such-getent");
+        assert_eq!(getent_account_with(&missing, b"alice").unwrap(), None);
+        assert_eq!(getent_group_with(&missing, b"dirkiri").unwrap(), None);
+        assert!(!initgroups_has_with(&missing, c"alice", 1002).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn member_and_uids_enforce_configured_group_only() {
+        let group = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"local".to_owned(), c"alice".to_owned(), c"ghost".to_owned()] };
+        let accounts = |uid: u32| -> io::Result<Option<Account>> {
+            Ok(match uid {
+                1001 => Some(Account { name: c"local".to_owned(), uid: 1001, gid: 1001 }),
+                5001 => Some(Account { name: c"alice".to_owned(), uid: 5001, gid: 5001 }),
+                5002 => Some(Account { name: c"dirgroup".to_owned(), uid: 5002, gid: 5002 }),
+                5003 => Some(Account { name: c"outsider".to_owned(), uid: 5003, gid: 5003 }),
+                5004 => Some(Account { name: c"primary".to_owned(), uid: 5004, gid: 998 }),
+                _ => None,
+            })
+        };
+        let initgroups = |user: &CStr, gid: u32| -> io::Result<bool> { Ok(user == c"dirgroup" && gid == 998) };
+
+        assert!(member_of_with(1001, Some(&group), accounts, initgroups).unwrap());
+        assert!(member_of_with(5001, Some(&group), accounts, initgroups).unwrap());
+        assert!(member_of_with(5002, Some(&group), accounts, initgroups).unwrap());
+        assert!(member_of_with(5004, Some(&group), accounts, initgroups).unwrap());
+        assert!(!member_of_with(5003, Some(&group), accounts, initgroups).unwrap(), "non-member refused");
+        assert!(!member_of_with(7777, Some(&group), accounts, initgroups).unwrap(), "unknown uid refused");
+        assert!(!member_of_with(5001, None, accounts, initgroups).unwrap(), "deleted group admits nobody");
+
+        // uids_of resolves directory members, omits missing accounts, and fails closed on errors.
+        let by_name = |name: &CStr| -> io::Result<Option<Account>> {
+            Ok(match name.to_bytes() {
+                b"local" => Some(Account { name: c"local".to_owned(), uid: 1001, gid: 1001 }),
+                b"alice" => Some(Account { name: c"alice".to_owned(), uid: 5001, gid: 5001 }),
+                _ => None,
+            })
+        };
+        assert_eq!(uids_of_with(&group, by_name).unwrap(), vec![1001, 5001]);
+        assert!(uids_of_with(&group, |_| Err(io::Error::other("directory unavailable"))).is_err());
     }
 }
