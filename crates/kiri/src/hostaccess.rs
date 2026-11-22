@@ -120,6 +120,10 @@ pub fn run(args: &[String]) -> io::Result<u8> {
             println!("{account} can use Kiri after logging out and back in (this system keeps no access lists)");
             Ok(SIGN_IN_AGAIN)
         }
+        Err(e) if crate::daemon::access::acl_too_large(&e) => {
+            println!("{account} can use Kiri after logging out and back in (the {GROUP} group has too many members for the socket access list)");
+            Ok(SIGN_IN_AGAIN)
+        }
         Err(e) => Err(io::Error::other(format!("couldn't give {account} the socket: {e}"))),
     }
 }

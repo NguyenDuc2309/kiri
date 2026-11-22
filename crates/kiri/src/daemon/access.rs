@@ -29,7 +29,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How often the people still connected are checked again.
@@ -38,6 +38,30 @@ const RECHECK: Duration = Duration::from_secs(2);
 const GETENT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maximum stdout accepted from a single `getent` call.
 const GETENT_MAX_STDOUT: usize = 4 * 1024 * 1024;
+/// Maximum distinct group members resolved for the socket's POSIX ACL.
+/// ext4 fits ~507 entries in a 4 KiB xattr block; larger groups fall back to
+/// the socket's 0660 group permissions.
+const MAX_ACL_MEMBERS: usize = 512;
+/// Number of directory account names queried per `getent passwd` call.
+const GETENT_PASSWD_BATCH: usize = 64;
+/// Short cache window for group lookups on the accept path, invalidated
+/// immediately whenever `/etc/group` changes.
+const GROUP_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Idle refresh cadence when directory or unresolved members are present.
+const IDLE_DIRECTORY_REFRESH: Duration = Duration::from_secs(6);
+/// Idle refresh cadence when all members are local and `/etc/group` is unchanged.
+const IDLE_LOCAL_NSS_REFRESH: Duration = Duration::from_secs(30);
+/// Consecutive ambiguous exit-2 misses before shrinking an existing socket ACL
+/// or closing an active directory connection.
+const DIRECTORY_MISS_GRACE: u32 = 3;
+/// Maximum cached per-uid decisions on the accept path.
+const MAX_RECENT_ENTRIES: usize = 1024;
+/// Maximum concurrent access checks on the accept path.
+const MAX_CONCURRENT_LOOKUPS: usize = 4;
+/// Maximum threads waiting for a lookup slot before failing fast.
+const MAX_WAITING_LOOKUPS: usize = 16;
+
+const ETC_GROUP: &str = "/etc/group";
 
 /// An account or group record and the buffer its strings live in.
 struct Rec<T> {
@@ -144,11 +168,29 @@ fn local_group_by_name(name: &CStr) -> io::Result<Option<Group>> {
     Ok(unsafe { nss(|rec, buf, len, out| libc::getgrnam_r(name.as_ptr(), rec, buf, len, out)) }?.and_then(|g| Group::from_rec(&g)))
 }
 
-fn account_by_uid(uid: u32) -> io::Result<Option<Account>> {
+fn local_account_by_uid(uid: u32) -> io::Result<Option<Account>> {
     // SAFETY: getpwuid_r with a passwd record and a buffer of the stated size.
-    match unsafe { nss(|rec, buf, len, out| libc::getpwuid_r(uid, rec, buf, len, out)) }? {
-        Some(a) => Ok(Account::from_rec(&a)),
-        None => Ok(getent_account(uid.to_string().as_bytes())?.filter(|a| a.uid == uid)),
+    Ok(unsafe { nss(|rec, buf, len, out| libc::getpwuid_r(uid, rec, buf, len, out)) }?.and_then(|a| Account::from_rec(&a)))
+}
+
+fn account_by_uid_detailed(uid: u32) -> io::Result<LookupResult<Account>> {
+    if let Some(a) = local_account_by_uid(uid)? {
+        return Ok(LookupResult::Found(a));
+    }
+    let Some(program) = find_getent() else { return Ok(LookupResult::NotFound) };
+    let key = uid.to_string();
+    match getent_account_lookup_with(program, key.as_bytes(), GETENT_TIMEOUT, GETENT_MAX_STDOUT)? {
+        LookupResult::Found(a) if a.uid == uid => Ok(LookupResult::Found(a)),
+        LookupResult::Found(_) | LookupResult::NotFound => Ok(LookupResult::NotFound),
+        LookupResult::UnavailableOrNotFound => Ok(LookupResult::UnavailableOrNotFound),
+    }
+}
+
+#[cfg(test)]
+fn account_by_uid(uid: u32) -> io::Result<Option<Account>> {
+    match account_by_uid_detailed(uid)? {
+        LookupResult::Found(a) => Ok(Some(a)),
+        LookupResult::NotFound | LookupResult::UnavailableOrNotFound => Ok(None),
     }
 }
 
@@ -346,20 +388,21 @@ fn exec_getent(program: &Path, args: &[&OsStr], timeout: Duration, max_bytes: us
     }
 }
 
-/// Runs `program -- <db> <key>`, returning `Ok(Some(stdout))` on exit 0,
-/// `Ok(None)` on exit 2 (no such key) or missing binary, and `Err` otherwise.
-fn run_getent_with_limits(program: &Path, db: &str, key: &[u8], timeout: Duration, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+/// Looks up one `passwd` record via `getent`, distinguishing exit 2 (absent or
+/// directory unavailable) from missing `getent` binary or invalid key.
+fn getent_account_lookup_with(program: &Path, key: &[u8], timeout: Duration, max_bytes: usize) -> io::Result<LookupResult<Account>> {
     if !valid_key(key) {
-        return Ok(None);
+        return Ok(LookupResult::NotFound);
     }
-    let args = [OsStr::new(db), OsStr::from_bytes(key)];
+    let args = [OsStr::new("passwd"), OsStr::from_bytes(key)];
     match exec_getent(program, &args, timeout, max_bytes)? {
-        GetentRaw::NoBinary => Ok(None),
+        GetentRaw::NoBinary => Ok(LookupResult::NotFound),
         GetentRaw::Ran(status, stdout) => match status.code() {
-            Some(0) => Ok(Some(stdout)),
-            // 2: no such key.
-            Some(2) => Ok(None),
-            _ => Err(io::Error::other(format!("getent {db} {}: {status}", String::from_utf8_lossy(key)))),
+            Some(0) => passwd_line(&stdout)
+                .map(LookupResult::Found)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent passwd output for {}", String::from_utf8_lossy(key)))),
+            Some(2) => Ok(LookupResult::UnavailableOrNotFound),
+            _ => Err(io::Error::other(format!("getent passwd {}: {status}", String::from_utf8_lossy(key)))),
         },
     }
 }
@@ -378,10 +421,80 @@ fn getent_account_with(program: &Path, key: &[u8]) -> io::Result<Option<Account>
 }
 
 fn getent_account_with_limits(program: &Path, key: &[u8], timeout: Duration, max_bytes: usize) -> io::Result<Option<Account>> {
-    let Some(stdout) = run_getent_with_limits(program, "passwd", key, timeout, max_bytes)? else { return Ok(None) };
-    passwd_line(&stdout)
-        .map(Some)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent passwd output for {}", String::from_utf8_lossy(key))))
+    match getent_account_lookup_with(program, key, timeout, max_bytes)? {
+        LookupResult::Found(a) => Ok(Some(a)),
+        LookupResult::NotFound | LookupResult::UnavailableOrNotFound => Ok(None),
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BatchAccounts {
+    accounts: Vec<Account>,
+    unresolved: usize,
+}
+
+fn parse_passwd_lines(text: &[u8]) -> io::Result<Vec<Account>> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trimmed = text.strip_suffix(b"\n").unwrap_or(text);
+    let mut out = Vec::new();
+    for raw in trimmed.split(|&b| b == b'\n') {
+        let account = passwd_line(raw).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unexpected getent passwd output"))?;
+        out.push(account);
+    }
+    Ok(out)
+}
+
+/// Queries a batch of non-numeric account names in one `getent passwd` call,
+/// falling back to single-key queries if a non-glibc `getent` rejects or
+/// ignores extra keys.
+fn getent_accounts_batch_with(program: &Path, keys: &[&CStr], timeout: Duration, max_bytes: usize) -> io::Result<BatchAccounts> {
+    if keys.is_empty() {
+        return Ok(BatchAccounts::default());
+    }
+    let mut args: Vec<&OsStr> = Vec::with_capacity(1 + keys.len());
+    args.push(OsStr::new("passwd"));
+    for k in keys {
+        args.push(OsStr::from_bytes(k.to_bytes()));
+    }
+    match exec_getent(program, &args, timeout, max_bytes)? {
+        GetentRaw::NoBinary => Ok(BatchAccounts::default()),
+        GetentRaw::Ran(status, stdout) => match status.code() {
+            Some(0) => {
+                let accounts = parse_passwd_lines(&stdout)?;
+                if accounts.is_empty() || accounts.len() > keys.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected getent passwd batch output"));
+                }
+                if keys.len() > 1 && accounts.len() < keys.len() {
+                    return getent_accounts_individually(program, keys, timeout, max_bytes);
+                }
+                Ok(BatchAccounts { accounts, unresolved: 0 })
+            }
+            Some(2) => {
+                let accounts = parse_passwd_lines(&stdout)?;
+                if accounts.len() > keys.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected getent passwd batch output"));
+                }
+                let unresolved = keys.len().saturating_sub(accounts.len()).max(1);
+                Ok(BatchAccounts { accounts, unresolved })
+            }
+            Some(1) if keys.len() > 1 => getent_accounts_individually(program, keys, timeout, max_bytes),
+            _ => Err(io::Error::other(format!("getent passwd batch: {status}"))),
+        },
+    }
+}
+
+fn getent_accounts_individually(program: &Path, keys: &[&CStr], timeout: Duration, max_bytes: usize) -> io::Result<BatchAccounts> {
+    let mut out = BatchAccounts::default();
+    for k in keys {
+        match getent_account_lookup_with(program, k.to_bytes(), timeout, max_bytes)? {
+            LookupResult::Found(a) => out.accounts.push(a),
+            LookupResult::UnavailableOrNotFound => out.unresolved += 1,
+            LookupResult::NotFound => {}
+        }
+    }
+    Ok(out)
 }
 
 /// A group resolved through NSS (`getent group`), returning `Ok(None)` only
@@ -424,36 +537,52 @@ fn getent_group_with(program: &Path, key: &[u8]) -> io::Result<Option<Group>> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitgroupsResult {
+    Member,
+    NotMember,
+    /// `getent initgroups` exited 2 (unknown user or NSS temporarily unavailable).
+    UnavailableOrNotFound,
+}
+
 /// Checks supplementary group memberships through NSS (`getent initgroups`),
 /// covering directory memberships that are not written into /etc/group.
-fn initgroups_has(user: &CStr, gid: u32) -> io::Result<bool> {
-    let Some(program) = find_getent() else { return Ok(false) };
-    initgroups_has_with(program, user, gid)
+fn initgroups_has_detailed(user: &CStr, gid: u32) -> io::Result<InitgroupsResult> {
+    let Some(program) = find_getent() else { return Ok(InitgroupsResult::NotMember) };
+    initgroups_has_detailed_with_limits(program, user, gid, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
 }
 
-fn initgroups_has_with(program: &Path, user: &CStr, gid: u32) -> io::Result<bool> {
-    initgroups_has_with_limits(program, user, gid, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
-}
-
-fn initgroups_has_with_limits(program: &Path, user: &CStr, gid: u32, timeout: Duration, max_bytes: usize) -> io::Result<bool> {
+fn initgroups_has_detailed_with_limits(program: &Path, user: &CStr, gid: u32, timeout: Duration, max_bytes: usize) -> io::Result<InitgroupsResult> {
     let key = user.to_bytes();
     if !valid_key(key) {
-        return Ok(false);
+        return Ok(InitgroupsResult::NotMember);
     }
     let args = [OsStr::new("initgroups"), OsStr::from_bytes(key)];
     match exec_getent(program, &args, timeout, max_bytes)? {
-        GetentRaw::NoBinary => Ok(false),
+        GetentRaw::NoBinary => Ok(InitgroupsResult::NotMember),
         GetentRaw::Ran(status, stdout) => match status.code() {
             Some(0) => {
                 let gids = initgroups_line(&stdout, key)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent initgroups output for {}", user.to_string_lossy())))?;
-                Ok(gids.contains(&gid))
+                Ok(if gids.contains(&gid) { InitgroupsResult::Member } else { InitgroupsResult::NotMember })
             }
-            // 1: database unknown (non-glibc getent); 2: no such key.
-            Some(1 | 2) => Ok(false),
+            // 1: database unknown (non-glibc getent).
+            Some(1) => Ok(InitgroupsResult::NotMember),
+            // 2: no such key or NSS temporarily unavailable.
+            Some(2) => Ok(InitgroupsResult::UnavailableOrNotFound),
             _ => Err(io::Error::other(format!("getent initgroups {}: {status}", user.to_string_lossy()))),
         },
     }
+}
+
+#[cfg(test)]
+fn initgroups_has_with(program: &Path, user: &CStr, gid: u32) -> io::Result<bool> {
+    initgroups_has_with_limits(program, user, gid, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
+}
+
+#[cfg(test)]
+fn initgroups_has_with_limits(program: &Path, user: &CStr, gid: u32, timeout: Duration, max_bytes: usize) -> io::Result<bool> {
+    Ok(initgroups_has_detailed_with_limits(program, user, gid, timeout, max_bytes)? == InitgroupsResult::Member)
 }
 
 /// `name:password:uid:gid:gecos:dir:shell`, the single line of `getent passwd`.
@@ -568,13 +697,100 @@ pub fn account_name(user: &str) -> io::Result<Option<String>> {
     }
 }
 
-/// The uids of the names in a group record, sorted. A name with no account
-/// is left out; a lookup that fails fails the whole list, so a slow directory
-/// never shrinks it.
-fn uids_of(group: &Group) -> io::Result<Vec<u32>> {
-    uids_of_with(group, account_by_name)
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResolvedMembers {
+    /// Sorted, deduplicated UIDs of all resolved members.
+    uids: Vec<u32>,
+    /// Members resolved through NSS (`getent`) rather than `/etc/passwd`.
+    directory_members: usize,
+    /// Members whose `getent passwd` lookup returned exit 2 (absent or NSS unavailable).
+    unresolved: usize,
+    /// True when distinct members exceed `MAX_ACL_MEMBERS`.
+    oversized: bool,
 }
 
+/// Resolves group member names to UIDs, using `/etc/passwd` first and batching
+/// directory accounts through `getent passwd`. Groups larger than
+/// `MAX_ACL_MEMBERS` skip lookup and fall back to 0660 group permissions.
+fn resolve_members(group: &Group) -> io::Result<ResolvedMembers> {
+    let program = find_getent();
+    resolve_members_with(
+        group,
+        local_account_by_name,
+        |chunk| match program {
+            Some(p) => getent_accounts_batch_with(p, chunk, GETENT_TIMEOUT, GETENT_MAX_STDOUT),
+            None => Ok(BatchAccounts::default()),
+        },
+        |name| match program {
+            Some(p) => getent_account_lookup_with(p, name.to_bytes(), GETENT_TIMEOUT, GETENT_MAX_STDOUT),
+            None => Ok(LookupResult::NotFound),
+        },
+    )
+}
+
+fn resolve_members_with(
+    group: &Group,
+    local_lookup: impl Fn(&CStr) -> io::Result<Option<Account>>,
+    batch_lookup: impl Fn(&[&CStr]) -> io::Result<BatchAccounts>,
+    single_lookup: impl Fn(&CStr) -> io::Result<LookupResult<Account>>,
+) -> io::Result<ResolvedMembers> {
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    let mut unique: Vec<&CStr> = Vec::new();
+    for name in &group.members {
+        if seen.insert(name.to_bytes()) {
+            unique.push(name.as_c_str());
+        }
+    }
+    if unique.len() > MAX_ACL_MEMBERS {
+        return Ok(ResolvedMembers { uids: Vec::new(), directory_members: 0, unresolved: 0, oversized: true });
+    }
+
+    let mut uids = Vec::new();
+    let mut dir_batch: Vec<&CStr> = Vec::new();
+    let mut numeric: Vec<&CStr> = Vec::new();
+    for name in unique {
+        if let Some(a) = local_lookup(name)? {
+            uids.push(a.uid);
+        } else if !valid_key(name.to_bytes()) {
+            continue;
+        } else if is_numeric_key(name.to_bytes()) {
+            numeric.push(name);
+        } else {
+            dir_batch.push(name);
+        }
+    }
+
+    let mut directory_members = 0usize;
+    let mut unresolved = 0usize;
+
+    for name in numeric {
+        match single_lookup(name)? {
+            LookupResult::Found(a) => {
+                if let Some(a) = match_account_name(name.to_bytes(), a) {
+                    uids.push(a.uid);
+                    directory_members += 1;
+                }
+            }
+            LookupResult::UnavailableOrNotFound => unresolved += 1,
+            LookupResult::NotFound => {}
+        }
+    }
+
+    for chunk in dir_batch.chunks(GETENT_PASSWD_BATCH) {
+        let batch = batch_lookup(chunk)?;
+        directory_members += batch.accounts.len();
+        unresolved += batch.unresolved;
+        for a in batch.accounts {
+            uids.push(a.uid);
+        }
+    }
+
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(ResolvedMembers { uids, directory_members, unresolved, oversized: false })
+}
+
+#[cfg(test)]
 fn uids_of_with(group: &Group, lookup: impl Fn(&CStr) -> io::Result<Option<Account>>) -> io::Result<Vec<u32>> {
     let mut out = Vec::new();
     for name in &group.members {
@@ -587,16 +803,21 @@ fn uids_of_with(group: &Group, lookup: impl Fn(&CStr) -> io::Result<Option<Accou
     Ok(out)
 }
 
-fn member_uids(group: &CStr) -> io::Result<Vec<u32>> {
-    uids_of(&group_by_name(group)?)
-}
-
 /// Gives every member of `group` read-write access to `socket` by name, so a
 /// member just added can use it without signing in again. Returns how many.
 pub fn grant(socket: &Path, group: &str) -> io::Result<usize> {
-    let uids = member_uids(&c_name(group)?)?;
-    set(socket, &uids)?;
-    Ok(uids.len())
+    let resolved = resolve_members(&group_by_name(&c_name(group)?)?)?;
+    if resolved.oversized {
+        let _ = set(socket, &[]);
+        return Err(io::Error::from_raw_os_error(libc::E2BIG));
+    }
+    if let Err(e) = set(socket, &resolved.uids) {
+        if acl_too_large(&e) {
+            let _ = set(socket, &[]);
+        }
+        return Err(e);
+    }
+    Ok(resolved.uids.len())
 }
 
 /// The uid at the other end of an accepted connection.
@@ -617,37 +838,182 @@ fn group_member(user: &CStr, primary_gid: libc::gid_t, group: &Group) -> bool {
     primary_gid == group.gid || group.members.iter().any(|m| m.as_c_str() == user)
 }
 
-/// The group's record, or `None` if the group was deleted: that leaves
-/// nobody in it, which is an answer, not a failure.
-fn current(group: &CStr) -> io::Result<Option<Group>> {
-    match group_by_name(group) {
-        Ok(g) => Ok(Some(g)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Membership {
+    /// Confirmed member.
+    Allowed,
+    /// Confirmed non-member (or deleted local group/account).
+    Revoked,
+    /// Ambiguous `getent` exit-2 miss (absent or directory service temporarily down).
+    MissingFromDirectory,
+}
+
+fn member_of_detailed(uid: u32, group: &LookupResult<Group>) -> io::Result<Membership> {
+    member_of_detailed_with(uid, group, account_by_uid_detailed, initgroups_has_detailed)
+}
+
+fn member_of_detailed_with(
+    uid: u32,
+    group: &LookupResult<Group>,
+    lookup: impl Fn(u32) -> io::Result<LookupResult<Account>>,
+    initgroups: impl Fn(&CStr, u32) -> io::Result<InitgroupsResult>,
+) -> io::Result<Membership> {
+    let group = match group {
+        LookupResult::Found(g) => g,
+        LookupResult::NotFound => return Ok(Membership::Revoked),
+        LookupResult::UnavailableOrNotFound => return Ok(Membership::MissingFromDirectory),
+    };
+    let a = match lookup(uid)? {
+        LookupResult::Found(a) => a,
+        LookupResult::NotFound => return Ok(Membership::Revoked),
+        LookupResult::UnavailableOrNotFound => return Ok(Membership::MissingFromDirectory),
+    };
+    if group_member(&a.name, a.gid, group) {
+        return Ok(Membership::Allowed);
+    }
+    match initgroups(&a.name, group.gid)? {
+        InitgroupsResult::Member => Ok(Membership::Allowed),
+        InitgroupsResult::NotMember => Ok(Membership::Revoked),
+        InitgroupsResult::UnavailableOrNotFound => Ok(Membership::MissingFromDirectory),
     }
 }
 
-/// Whether the account `uid` is in the group now. No account, or no group: no.
-fn member_of(uid: u32, group: Option<&Group>) -> io::Result<bool> {
-    member_of_with(uid, group, account_by_uid, initgroups_has)
-}
-
+#[cfg(test)]
 fn member_of_with(
     uid: u32,
     group: Option<&Group>,
     lookup: impl Fn(u32) -> io::Result<Option<Account>>,
     initgroups: impl Fn(&CStr, u32) -> io::Result<bool>,
 ) -> io::Result<bool> {
-    let Some(group) = group else { return Ok(false) };
-    let Some(a) = lookup(uid)? else { return Ok(false) };
-    if group_member(&a.name, a.gid, group) {
-        return Ok(true);
-    }
-    initgroups(&a.name, group.gid)
+    let g = match group {
+        Some(g) => LookupResult::Found(g.clone()),
+        None => LookupResult::NotFound,
+    };
+    let m = member_of_detailed_with(
+        uid,
+        &g,
+        |u| Ok(lookup(u)?.map_or(LookupResult::NotFound, LookupResult::Found)),
+        |n, gid| Ok(if initgroups(n, gid)? { InitgroupsResult::Member } else { InitgroupsResult::NotMember }),
+    )?;
+    Ok(m == Membership::Allowed)
 }
 
+#[cfg(test)]
 fn member(uid: u32, group: &CStr) -> io::Result<bool> {
-    member_of(uid, current(group)?.as_ref())
+    Ok(member_of_detailed(uid, &group_by_name_detailed(group)?)? == Membership::Allowed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some(FileStamp { dev: m.dev(), ino: m.ino(), len: m.len(), mtime_sec: m.mtime(), mtime_nsec: m.mtime_nsec() })
+}
+
+#[derive(Debug, Clone)]
+enum CachedDecision {
+    Allowed,
+    Denied,
+    Failed(io::ErrorKind, String),
+}
+
+impl CachedDecision {
+    fn from_result(res: &io::Result<bool>) -> Self {
+        match res {
+            Ok(true) => Self::Allowed,
+            Ok(false) => Self::Denied,
+            Err(e) => Self::Failed(e.kind(), e.to_string()),
+        }
+    }
+
+    fn to_result(&self) -> io::Result<bool> {
+        match self {
+            Self::Allowed => Ok(true),
+            Self::Denied => Ok(false),
+            Self::Failed(kind, msg) => Err(io::Error::new(*kind, msg.clone())),
+        }
+    }
+}
+
+#[derive(Default)]
+struct LookupState {
+    recent: HashMap<u32, (CachedDecision, Instant)>,
+    in_flight: HashMap<u32, Arc<Condvar>>,
+    active: usize,
+    waiting: usize,
+}
+
+struct LookupGuard<'a> {
+    gate: &'a Gate,
+    uid: u32,
+    waiter: Arc<Condvar>,
+    finished: bool,
+}
+
+impl<'a> LookupGuard<'a> {
+    fn finish(mut self, res: &io::Result<bool>) {
+        self.finished = true;
+        let mut state = self.gate.lookup.lock().unwrap_or_else(|e| e.into_inner());
+        Gate::insert_recent(&mut state.recent, self.uid, CachedDecision::from_result(res));
+        state.in_flight.remove(&self.uid);
+        state.active = state.active.saturating_sub(1);
+        self.waiter.notify_all();
+        self.gate.lookup_slot.notify_one();
+    }
+}
+
+impl Drop for LookupGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut state = self.gate.lookup.lock().unwrap_or_else(|e| e.into_inner());
+            state.in_flight.remove(&self.uid);
+            state.active = state.active.saturating_sub(1);
+            self.waiter.notify_all();
+            self.gate.lookup_slot.notify_one();
+        }
+    }
+}
+
+struct CachedGroup {
+    stamp: Option<FileStamp>,
+    at: Instant,
+    result: Result<LookupResult<Group>, (io::ErrorKind, String)>,
+}
+
+#[derive(Debug, Default)]
+struct AclState {
+    /// Member names as of the last evaluated group record.
+    names: Option<Vec<CString>>,
+    /// Exact sorted UID set last written to the socket ACL.
+    uids: Option<Vec<u32>>,
+    /// Whether the last resolution included NSS directory accounts.
+    has_directory: bool,
+    /// Whether the last resolution had unresolved names (exit 2).
+    has_unresolved: bool,
+    /// Consecutive ticks with unresolved members (or exit-2 group).
+    unresolved_streak: u32,
+    /// Member list for which ACL writes permanently failed or exceeded limits.
+    skipped_for_names: Option<Vec<CString>>,
+    /// Timestamp of the last full group/ACL refresh.
+    last_refresh: Option<Instant>,
+    /// Last observed `/etc/group` stamp so local edits trigger immediate refresh.
+    etc_group_stamp: Option<FileStamp>,
+    /// Avoid repeating the oversized/permanent-error warning on every tick.
+    warned_skip: bool,
+}
+
+impl AclState {
+    fn initialized(&self) -> bool {
+        self.uids.is_some() || self.skipped_for_names.is_some()
+    }
 }
 
 /// Who may use the engine's socket: root, the account the daemon runs as, and
@@ -661,9 +1027,18 @@ pub struct Gate {
     open: Mutex<HashMap<u64, (u32, UnixStream)>>,
     next: AtomicU64,
     failing: AtomicBool,
-    /// Recent answers by uid, so the docker CLI's burst of connections per
-    /// command costs one lookup. They last no longer than the recheck does.
-    recent: Mutex<HashMap<u32, (bool, Instant)>>,
+    /// Recent per-uid decisions, in-flight coalescing, and concurrency cap so
+    /// bursts of connections or local lookup storms stay bounded.
+    lookup: Mutex<LookupState>,
+    lookup_slot: Condvar,
+    /// Short-TTL group lookup cache for the accept path, invalidated when
+    /// `/etc/group` changes.
+    group_cache: Mutex<Option<CachedGroup>>,
+    /// Consecutive ambiguous exit-2 misses per connected uid.
+    misses: Mutex<HashMap<u32, u32>>,
+    /// UIDs written by `grant()` at startup, used to seed `watch()` so an
+    /// outage right after boot does not shrink the initial ACL on tick 1.
+    startup_uids: Mutex<Option<Vec<u32>>>,
 }
 
 /// A connection the gate let in; dropping it stops watching that connection.
@@ -683,75 +1058,337 @@ impl Gate {
         let group = CString::new(group.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: geteuid cannot fail.
         let owner = unsafe { libc::geteuid() };
-        Ok(Arc::new(Gate { group, sockets: sockets.iter().map(|s| s.to_path_buf()).collect(), owner, open: Mutex::default(), next: AtomicU64::new(0), failing: AtomicBool::new(false), recent: Mutex::default() }))
+        Ok(Arc::new(Gate {
+            group,
+            sockets: sockets.iter().map(|s| s.to_path_buf()).collect(),
+            owner,
+            open: Mutex::default(),
+            next: AtomicU64::new(0),
+            failing: AtomicBool::new(false),
+            lookup: Mutex::default(),
+            lookup_slot: Condvar::new(),
+            group_cache: Mutex::default(),
+            misses: Mutex::default(),
+            startup_uids: Mutex::default(),
+        }))
     }
 
     fn name(&self) -> std::borrow::Cow<'_, str> {
         self.group.to_string_lossy()
     }
 
+    fn insert_recent(recent: &mut HashMap<u32, (CachedDecision, Instant)>, uid: u32, decision: CachedDecision) {
+        recent.retain(|_, (_, at)| at.elapsed() < RECHECK);
+        if recent.len() >= MAX_RECENT_ENTRIES
+            && !recent.contains_key(&uid)
+            && let Some(&oldest) = recent.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k)
+        {
+            recent.remove(&oldest);
+        }
+        recent.insert(uid, (decision, Instant::now()));
+    }
+
+    fn remember_decision(&self, uid: u32, decision: CachedDecision) {
+        let mut state = self.lookup.lock().unwrap_or_else(|e| e.into_inner());
+        Self::insert_recent(&mut state.recent, uid, decision);
+    }
+
+    fn store_group_cache(&self, stamp: Option<FileStamp>, at: Instant, result: Result<LookupResult<Group>, (io::ErrorKind, String)>) {
+        *self.group_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(CachedGroup { stamp, at, result });
+    }
+
+    fn cached_group(&self) -> io::Result<LookupResult<Group>> {
+        let stamp = file_stamp(Path::new(ETC_GROUP));
+        let now = Instant::now();
+        {
+            let cache = self.group_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = cache.as_ref()
+                && c.stamp == stamp
+                && now.saturating_duration_since(c.at) < GROUP_CACHE_TTL
+            {
+                return match &c.result {
+                    Ok(g) => Ok(g.clone()),
+                    Err((kind, msg)) => Err(io::Error::new(*kind, msg.clone())),
+                };
+            }
+        }
+        let fresh = group_by_name_detailed(&self.group);
+        let stored = match &fresh {
+            Ok(g) => Ok(g.clone()),
+            Err(e) => Err((e.kind(), e.to_string())),
+        };
+        self.store_group_cache(stamp, Instant::now(), stored);
+        fresh
+    }
+
     fn allowed(&self, uid: u32) -> io::Result<bool> {
+        self.allowed_with(uid, |u| {
+            let group = self.cached_group()?;
+            Ok(member_of_detailed(u, &group)? == Membership::Allowed)
+        })
+    }
+
+    fn allowed_with(&self, uid: u32, check: impl Fn(u32) -> io::Result<bool>) -> io::Result<bool> {
         if uid == 0 || uid == self.owner {
             return Ok(true);
         }
-        if let Some((yes, at)) = self.recent.lock().unwrap_or_else(|e| e.into_inner()).get(&uid)
-            && at.elapsed() < RECHECK
-        {
-            return Ok(*yes);
-        }
-        let yes = member(uid, &self.group)?;
-        self.remember(uid, yes);
-        Ok(yes)
-    }
+        let mut state = self.lookup.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some((decision, at)) = state.recent.get(&uid)
+                && at.elapsed() < RECHECK
+            {
+                return decision.to_result();
+            }
+            if let Some(waiter) = state.in_flight.get(&uid).cloned() {
+                state = waiter.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            if state.active >= MAX_CONCURRENT_LOOKUPS {
+                if state.waiting >= MAX_WAITING_LOOKUPS {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "too many concurrent access checks"));
+                }
+                state.waiting += 1;
+                state = self.lookup_slot.wait(state).unwrap_or_else(|e| e.into_inner());
+                state.waiting -= 1;
+                continue;
+            }
+            let waiter = Arc::new(Condvar::new());
+            state.in_flight.insert(uid, waiter.clone());
+            state.active += 1;
+            drop(state);
 
-    fn remember(&self, uid: u32, yes: bool) {
-        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
-        recent.retain(|_, (_, at)| at.elapsed() < RECHECK);
-        recent.insert(uid, (yes, Instant::now()));
+            let guard = LookupGuard { gate: self, uid, waiter, finished: false };
+            let res = check(uid);
+            guard.finish(&res);
+            return res;
+        }
     }
 
     /// One recheck: everyone connected against one read of the group, then
-    /// the access list, if the group's names changed since it was written.
-    /// `listed`: the names the list was last written for.
-    fn tick(&self, listed: &mut Option<Vec<CString>>) {
-        let group = current(&self.group);
+    /// the access list, if the group's members or directory UIDs changed.
+    fn tick(&self, state: &mut AclState) {
+        let now = Instant::now();
+        let stamp = file_stamp(Path::new(ETC_GROUP));
+        self.tick_with(state, now, stamp, || group_by_name_detailed(&self.group), member_of_detailed, resolve_members, |uids| self.set_all(uids));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tick_with(
+        &self,
+        state: &mut AclState,
+        now: Instant,
+        stamp: Option<FileStamp>,
+        fetch_group: impl Fn() -> io::Result<LookupResult<Group>>,
+        check_member: impl Fn(u32, &LookupResult<Group>) -> io::Result<Membership>,
+        resolve: impl Fn(&Group) -> io::Result<ResolvedMembers>,
+        write_acl: impl Fn(&[u32]) -> io::Result<()>,
+    ) {
         let connected = !self.open.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        if connected {
-            let closed = self.sweep_with(|uid| {
+        let stamp_changed = state.etc_group_stamp != stamp;
+
+        // Avoid idle `getent` forks when nobody is connected, `/etc/group` is
+        // unchanged, and no unresolved directory members need fast retry.
+        if !connected && !stamp_changed && state.initialized() {
+            let fast_unresolved = state.has_unresolved && state.unresolved_streak < DIRECTORY_MISS_GRACE;
+            if !fast_unresolved {
+                let interval = if state.has_directory || state.has_unresolved { IDLE_DIRECTORY_REFRESH } else { IDLE_LOCAL_NSS_REFRESH };
+                if let Some(last) = state.last_refresh
+                    && now.saturating_duration_since(last) < interval
+                {
+                    return;
+                }
+            }
+        }
+
+        let group = fetch_group();
+        if let Ok(ref g) = group {
+            self.store_group_cache(stamp, now, Ok(g.clone()));
+        }
+
+        let closed_uids = if connected {
+            self.sweep_membership_with(|uid| {
                 if uid == 0 || uid == self.owner {
-                    return Ok(true);
+                    return Ok(Membership::Allowed);
                 }
                 let g = group.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
-                let yes = member_of(uid, g.as_ref())?;
-                self.remember(uid, yes);
-                Ok(yes)
-            });
-            if closed > 0 {
-                *listed = None;
-            }
-        }
+                check_member(uid, g)
+            })
+        } else {
+            HashSet::new()
+        };
+
         let Ok(group) = group else { return };
-        let now: Vec<CString> = group.as_ref().map(|g| g.members.clone()).unwrap_or_default();
-        if listed.as_ref() == Some(&now) {
-            return;
-        }
-        // Only a list actually written counts: anything else is tried again.
-        let written = group.as_ref().map_or(Ok(Vec::new()), uids_of).and_then(|uids| self.set_all(&uids).map(|()| uids.len()));
-        match written {
-            Ok(n) => {
-                crate::diag::info!("socket access list written", members = n);
-                *listed = Some(now);
+        state.etc_group_stamp = stamp;
+
+        match group {
+            LookupResult::NotFound => {
+                state.unresolved_streak = 0;
+                state.has_directory = false;
+                state.has_unresolved = false;
+                state.skipped_for_names = None;
+                state.warned_skip = false;
+                state.last_refresh = Some(now);
+                if state.uids.as_deref() == Some(&[]) {
+                    state.names = Some(Vec::new());
+                    return;
+                }
+                match write_acl(&[]) {
+                    Ok(()) => {
+                        crate::diag::info!("socket access list written", members = 0);
+                        state.names = Some(Vec::new());
+                        state.uids = Some(Vec::new());
+                    }
+                    Err(e) if acl_permanent_err(&e) => {
+                        state.names = Some(Vec::new());
+                        state.skipped_for_names = Some(Vec::new());
+                    }
+                    Err(e) => crate::diag::warn!("socket access list not written", error = e),
+                }
             }
-            Err(e) if unsupported(&e) => *listed = Some(now),
-            Err(e) => crate::diag::warn!("socket access list not written", error = e),
+            LookupResult::UnavailableOrNotFound => {
+                // Ambiguous exit 2 on `getent group`: do not wipe an existing
+                // ACL on a single transient outage; clear only after grace.
+                state.has_unresolved = true;
+                state.unresolved_streak = state.unresolved_streak.saturating_add(1);
+                state.last_refresh = Some(now);
+                let existing_nonempty = state.uids.as_ref().is_some_and(|u| !u.is_empty());
+                if existing_nonempty && state.unresolved_streak < DIRECTORY_MISS_GRACE {
+                    return;
+                }
+                if state.uids.as_deref() == Some(&[]) {
+                    state.names = Some(Vec::new());
+                    return;
+                }
+                match write_acl(&[]) {
+                    Ok(()) => {
+                        crate::diag::info!("socket access list written", members = 0);
+                        state.names = Some(Vec::new());
+                        state.uids = Some(Vec::new());
+                    }
+                    Err(e) if acl_permanent_err(&e) => {
+                        state.names = Some(Vec::new());
+                        state.skipped_for_names = Some(Vec::new());
+                    }
+                    Err(e) => crate::diag::warn!("socket access list not written", error = e),
+                }
+            }
+            LookupResult::Found(group) => {
+                let now_names = group.members.clone();
+                let names_changed = state.names.as_ref() != Some(&now_names);
+
+                if !names_changed && state.skipped_for_names.as_ref() == Some(&now_names) {
+                    state.last_refresh = Some(now);
+                    return;
+                }
+
+                let refresh_due = !state.initialized()
+                    || names_changed
+                    || !closed_uids.is_empty()
+                    || (state.has_unresolved && state.unresolved_streak < DIRECTORY_MISS_GRACE)
+                    || ((state.has_directory || state.has_unresolved) && state.last_refresh.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_DIRECTORY_REFRESH));
+
+                if !refresh_due {
+                    return;
+                }
+
+                let resolved = match resolve(&group) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        crate::diag::warn!("socket access list not written", error = e);
+                        return;
+                    }
+                };
+
+                state.last_refresh = Some(now);
+                state.has_directory = resolved.directory_members > 0;
+                state.has_unresolved = resolved.unresolved > 0;
+
+                if resolved.oversized {
+                    if state.uids.as_ref().is_none_or(|u| !u.is_empty()) {
+                        let _ = write_acl(&[]);
+                    }
+                    if !state.warned_skip {
+                        crate::diag::warn!("socket access list skipped: group exceeds access list limit; using group permissions", group = self.name(), members = now_names.len());
+                        state.warned_skip = true;
+                    }
+                    state.names = Some(now_names.clone());
+                    state.uids = Some(Vec::new());
+                    state.skipped_for_names = Some(now_names);
+                    state.unresolved_streak = 0;
+                    return;
+                }
+
+                if resolved.unresolved > 0 {
+                    state.unresolved_streak = state.unresolved_streak.saturating_add(1);
+                } else {
+                    state.unresolved_streak = 0;
+                }
+
+                let effective_uids = if resolved.unresolved > 0 && state.unresolved_streak < DIRECTORY_MISS_GRACE {
+                    if let Some(prev) = &state.uids {
+                        let mut merged: Vec<u32> = prev.iter().copied().filter(|u| !closed_uids.contains(u)).collect();
+                        merged.extend(resolved.uids.iter().copied());
+                        merged.sort_unstable();
+                        merged.dedup();
+                        merged
+                    } else {
+                        resolved.uids
+                    }
+                } else {
+                    resolved.uids
+                };
+
+                if state.uids.as_ref() == Some(&effective_uids) {
+                    state.names = Some(now_names);
+                    state.skipped_for_names = None;
+                    state.warned_skip = false;
+                    return;
+                }
+
+                match write_acl(&effective_uids) {
+                    Ok(()) => {
+                        crate::diag::info!("socket access list written", members = effective_uids.len());
+                        state.names = Some(now_names);
+                        state.uids = Some(effective_uids);
+                        state.skipped_for_names = None;
+                        state.warned_skip = false;
+                    }
+                    Err(e) if acl_too_large(&e) => {
+                        let _ = write_acl(&[]);
+                        if !state.warned_skip {
+                            crate::diag::warn!("socket access list skipped: filesystem access list limit reached; using group permissions", group = self.name(), error = e);
+                            state.warned_skip = true;
+                        }
+                        state.names = Some(now_names.clone());
+                        state.uids = Some(Vec::new());
+                        state.skipped_for_names = Some(now_names);
+                    }
+                    Err(e) if unsupported(&e) => {
+                        state.names = Some(now_names.clone());
+                        state.skipped_for_names = Some(now_names);
+                    }
+                    Err(e) => crate::diag::warn!("socket access list not written", error = e),
+                }
+            }
         }
     }
 
     /// Writes the socket's access list for the group's current members.
     pub fn grant(&self) -> io::Result<usize> {
-        let uids = member_uids(&self.group)?;
-        self.set_all(&uids)?;
-        Ok(uids.len())
+        let resolved = resolve_members(&group_by_name(&self.group)?)?;
+        if resolved.oversized {
+            let _ = self.set_all(&[]);
+            return Err(io::Error::from_raw_os_error(libc::E2BIG));
+        }
+        if let Err(e) = self.set_all(&resolved.uids) {
+            if acl_too_large(&e) {
+                let _ = self.set_all(&[]);
+            }
+            return Err(e);
+        }
+        let len = resolved.uids.len();
+        *self.startup_uids.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolved.uids);
+        Ok(len)
     }
 
     /// Writes each socket's access list.
@@ -792,15 +1429,35 @@ impl Gate {
     /// Checks everyone still connected, once per account, and closes the
     /// connections of anyone no longer allowed. A failed lookup leaves the
     /// connections open (new ones are refused until lookups work again).
-    fn sweep_with(&self, check: impl Fn(u32) -> io::Result<bool>) -> usize {
+    /// Ambiguous directory exit-2 misses use a grace window before closing.
+    fn sweep_membership_with(&self, check: impl Fn(u32) -> io::Result<Membership>) -> HashSet<u32> {
         let uids: HashSet<u32> = self.open.lock().unwrap_or_else(|e| e.into_inner()).values().map(|(u, _)| *u).collect();
         let mut removed = HashSet::new();
         let mut failed = None;
+        let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+        misses.retain(|u, _| uids.contains(u));
+        drop(misses);
+
         for uid in uids {
             match check(uid) {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(Membership::Allowed) => {
+                    self.misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+                    self.remember_decision(uid, CachedDecision::Allowed);
+                }
+                Ok(Membership::Revoked) => {
+                    self.misses.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+                    self.remember_decision(uid, CachedDecision::Denied);
                     removed.insert(uid);
+                }
+                Ok(Membership::MissingFromDirectory) => {
+                    self.remember_decision(uid, CachedDecision::Denied);
+                    let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+                    let count = misses.entry(uid).or_insert(0);
+                    *count = count.saturating_add(1);
+                    if *count >= DIRECTORY_MISS_GRACE {
+                        misses.remove(&uid);
+                        removed.insert(uid);
+                    }
                 }
                 Err(e) => failed = Some(e),
             }
@@ -811,9 +1468,8 @@ impl Gate {
             _ => {}
         }
         if removed.is_empty() {
-            return 0;
+            return removed;
         }
-        let mut closed = 0;
         // Taken out as they're closed, so a thread that takes a while to
         // notice isn't closed and logged again on every recheck.
         self.open.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (uid, conn)| {
@@ -823,25 +1479,31 @@ impl Gate {
             // Ends the connection for every thread using it: reads see the
             // end, writes fail, as if the client had hung up.
             let _ = conn.shutdown(Shutdown::Both);
-            closed += 1;
             false
         });
         for uid in &removed {
             crate::diag::warn!("connections closed: user is no longer in the access group", group = self.name(), uid = uid);
         }
-        closed
+        removed
+    }
+
+    #[cfg(test)]
+    fn sweep_with(&self, check: impl Fn(u32) -> io::Result<bool>) -> usize {
+        self.sweep_membership_with(|uid| check(uid).map(|yes| if yes { Membership::Allowed } else { Membership::Revoked })).len()
     }
 
     /// Checks everyone connected every few seconds, and writes the access
     /// list again whenever the group's members change.
     pub fn watch(self: Arc<Self>) -> io::Result<()> {
         std::thread::Builder::new().name("kiri-access".into()).spawn(move || {
-            // Unknown at first: the first recheck writes the list once more,
-            // so a change between startup's write and now isn't missed.
-            let mut listed = None;
+            // Names unknown at first so tick 1 catches any change after startup;
+            // seed uids from startup grant() so a brief outage right after boot
+            // does not shrink the initial ACL on tick 1.
+            let initial_uids = self.startup_uids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut state = AclState { uids: initial_uids, ..AclState::default() };
             loop {
                 std::thread::sleep(RECHECK);
-                self.tick(&mut listed);
+                self.tick(&mut state);
             }
         })?;
         Ok(())
@@ -874,6 +1536,16 @@ fn set_each(sockets: &[PathBuf], uids: &[u32], set: impl Fn(&Path, &[u32]) -> io
 /// (a filesystem without ACLs): then only signing in again lets a new member in.
 pub fn unsupported(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EOPNOTSUPP)
+}
+
+/// Whether a failure to write the list means the member list exceeds the
+/// filesystem's POSIX ACL size limit: fall back to the socket's 0660 group.
+pub fn acl_too_large(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::E2BIG))
+}
+
+fn acl_permanent_err(e: &io::Error) -> bool {
+    unsupported(e) || acl_too_large(e)
 }
 
 /// The kernel's form of an access list (`system.posix_acl_access`): a version,
@@ -1138,14 +1810,15 @@ mod tests {
         };
         let (conn, _) = listener.accept().unwrap();
         let _seat = gate.admit(&conn).expect("a member is let in");
-        let mut listed = None;
-        gate.tick(&mut listed);
+        let mut state = AclState::default();
+        gate.tick(&mut state);
         assert_eq!(gate.open.lock().unwrap().len(), 1, "still a member");
 
         run(&["gpasswd", "-d", "kiritest", "kiritestg"]);
-        gate.tick(&mut listed);
+        gate.tick(&mut state);
         assert!(gate.open.lock().unwrap().is_empty(), "removed: their connection is closed");
-        assert_eq!(listed, Some(vec![]), "and the list is written without them");
+        assert_eq!(state.names, Some(vec![]), "and the list is written without them");
+        assert_eq!(state.uids, Some(vec![]), "and the list uids are cleared");
         let mut status = 0;
         // SAFETY: waits for the child forked above.
         unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -1529,5 +2202,391 @@ mod tests {
         assert!(initgroups_has_with(&prog, c"alice", 2_147_483_648).unwrap());
         assert!(!initgroups_has_with(&prog, c"alice", 1234).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uids_of_batches_directory_lookups_and_caps_oversized_groups() {
+        let dir = make_temp_dir("batch");
+        let calls = dir.join("calls");
+        let prog = write_test_script(
+            &dir,
+            "fake-getent",
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = \"--\" ] || exit 9\n\
+                 shift\n\
+                 db=\"$1\"; shift\n\
+                 echo x >> \"{}\"\n\
+                 [ \"$db\" = \"passwd\" ] || exit 2\n\
+                 rc=0\n\
+                 for key in \"$@\"; do\n\
+                   case \"$key\" in\n\
+                     dir1) echo 'dir1:x:5001:5001::/:/bin/sh' ;;\n\
+                     dir2) echo 'dir2:x:5002:5002::/:/bin/sh' ;;\n\
+                     dir3) echo 'dir3:x:5003:5003::/:/bin/sh' ;;\n\
+                     dir4) echo 'dir4:x:5004:5004::/:/bin/sh' ;;\n\
+                     dir5) echo 'dir5:x:5005:5005::/:/bin/sh' ;;\n\
+                     *) rc=2 ;;\n\
+                   esac\n\
+                 done\n\
+                 exit \"$rc\"\n",
+                calls.display(),
+            ),
+        );
+
+        let group = Group {
+            name: c"kiri".to_owned(),
+            gid: 998,
+            members: vec![c"local".to_owned(), c"dir1".to_owned(), c"dir2".to_owned(), c"dir3".to_owned(), c"dir4".to_owned(), c"dir5".to_owned(), c"ghost".to_owned()],
+        };
+        let resolved = resolve_members_with(
+            &group,
+            |n| Ok((n == c"local").then(|| Account { name: c"local".to_owned(), uid: 1001, gid: 1001 })),
+            |chunk| getent_accounts_batch_with(&prog, chunk, GETENT_TIMEOUT, GETENT_MAX_STDOUT),
+            |n| getent_account_lookup_with(&prog, n.to_bytes(), GETENT_TIMEOUT, GETENT_MAX_STDOUT),
+        )
+        .unwrap();
+        assert_eq!(resolved.uids, vec![1001, 5001, 5002, 5003, 5004, 5005]);
+        assert_eq!(resolved.directory_members, 5);
+        assert_eq!(resolved.unresolved, 1);
+        assert!(!resolved.oversized);
+        // All 6 directory names were queried in a single batched `getent passwd` call.
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+
+        // Groups exceeding MAX_ACL_MEMBERS skip lookups completely and flag oversized.
+        let huge = Group { name: c"corp".to_owned(), gid: 998, members: (0..=MAX_ACL_MEMBERS).map(|i| CString::new(format!("u{i}")).unwrap()).collect() };
+        let batch_calls = AtomicU64::new(0);
+        let resolved = resolve_members_with(
+            &huge,
+            |_| {
+                batch_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            },
+            |_| {
+                batch_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(BatchAccounts::default())
+            },
+            |_| {
+                batch_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::NotFound)
+            },
+        )
+        .unwrap();
+        assert!(resolved.oversized);
+        assert!(resolved.uids.is_empty());
+        assert_eq!(batch_calls.load(Ordering::Relaxed), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tick_stops_retrying_on_acl_size_errors_and_clears_stale_acl() {
+        let g = gate();
+        let mut state = AclState::default();
+        let t0 = Instant::now();
+        let stamp = Some(FileStamp { dev: 1, ino: 1, len: 10, mtime_sec: 1, mtime_nsec: 0 });
+        let grp_big = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"u1".to_owned(), c"u2".to_owned(), c"u3".to_owned()] };
+        let grp_small = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"u1".to_owned()] };
+
+        let resolve_calls = AtomicU64::new(0);
+        let writes: Mutex<Vec<Vec<u32>>> = Mutex::default();
+
+        // Tick 1: set_all fails with ENOSPC -> clears stale ACL (&[]) and stops retrying.
+        g.tick_with(
+            &mut state,
+            t0,
+            stamp,
+            || Ok(LookupResult::Found(grp_big.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| {
+                resolve_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(ResolvedMembers { uids: vec![5001, 5002, 5003], directory_members: 3, unresolved: 0, oversized: false })
+            },
+            |uids| {
+                writes.lock().unwrap().push(uids.to_vec());
+                if uids.len() > 2 { Err(io::Error::from_raw_os_error(libc::ENOSPC)) } else { Ok(()) }
+            },
+        );
+        assert_eq!(resolve_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*writes.lock().unwrap(), vec![vec![5001, 5002, 5003], vec![]]);
+
+        // Tick 2 (even after directory refresh interval): unchanged member list does NOT re-resolve or retry.
+        g.tick_with(
+            &mut state,
+            t0 + IDLE_DIRECTORY_REFRESH + Duration::from_secs(1),
+            stamp,
+            || Ok(LookupResult::Found(grp_big.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| {
+                resolve_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(ResolvedMembers { uids: vec![5001, 5002, 5003], directory_members: 3, unresolved: 0, oversized: false })
+            },
+            |uids| {
+                writes.lock().unwrap().push(uids.to_vec());
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            },
+        );
+        assert_eq!(resolve_calls.load(Ordering::Relaxed), 1, "must not repeat lookups on ENOSPC");
+        assert_eq!(writes.lock().unwrap().len(), 2);
+
+        // Tick 3: group shrinks -> retries and succeeds.
+        let stamp2 = Some(FileStamp { dev: 1, ino: 1, len: 5, mtime_sec: 2, mtime_nsec: 0 });
+        g.tick_with(
+            &mut state,
+            t0 + IDLE_DIRECTORY_REFRESH + Duration::from_secs(3),
+            stamp2,
+            || Ok(LookupResult::Found(grp_small.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| {
+                resolve_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(ResolvedMembers { uids: vec![5001], directory_members: 1, unresolved: 0, oversized: false })
+            },
+            |uids| {
+                writes.lock().unwrap().push(uids.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(resolve_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(writes.lock().unwrap().last().unwrap(), &vec![5001]);
+    }
+
+    #[test]
+    fn allowed_coalesces_concurrent_lookups_and_caches_errors() {
+        let g = gate();
+        let calls = Arc::new(AtomicU64::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let g = g.clone();
+                let calls = calls.clone();
+                s.spawn(move || {
+                    let yes = g
+                        .allowed_with(5001, |_| {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_millis(60));
+                            Ok(false)
+                        })
+                        .unwrap();
+                    assert!(!yes);
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "concurrent checks for the same uid must coalesce");
+
+        // Lookup errors (e.g. getent timeout) are short-TTL cached too so repeated
+        // connection attempts do not spawn a fork storm.
+        let err_calls = AtomicU64::new(0);
+        let e1 = g
+            .allowed_with(5002, |_| {
+                err_calls.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "getent timed out"))
+            })
+            .unwrap_err();
+        assert_eq!(e1.kind(), io::ErrorKind::TimedOut);
+        let e2 = g
+            .allowed_with(5002, |_| {
+                err_calls.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "getent timed out"))
+            })
+            .unwrap_err();
+        assert_eq!(e2.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(err_calls.load(Ordering::Relaxed), 1, "cached error must avoid immediate re-lookup");
+    }
+
+    #[test]
+    fn tick_skips_idle_local_group_refreshes_until_file_changes_or_interval_elapses() {
+        let g = gate();
+        let mut state = AclState::default();
+        let t0 = Instant::now();
+        let stamp1 = Some(FileStamp { dev: 1, ino: 1, len: 100, mtime_sec: 10, mtime_nsec: 0 });
+        let stamp2 = Some(FileStamp { dev: 1, ino: 1, len: 110, mtime_sec: 11, mtime_nsec: 0 });
+        let grp = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"local".to_owned()] };
+        let group_fetches = AtomicU64::new(0);
+
+        // Initial tick initializes local-only group state.
+        g.tick_with(
+            &mut state,
+            t0,
+            stamp1,
+            || {
+                group_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::Found(grp.clone()))
+            },
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 0, oversized: false }),
+            |_| Ok(()),
+        );
+        assert_eq!(group_fetches.load(Ordering::Relaxed), 1);
+
+        // Idle tick 2s later with unchanged /etc/group skips getent completely.
+        g.tick_with(
+            &mut state,
+            t0 + RECHECK,
+            stamp1,
+            || {
+                group_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::Found(grp.clone()))
+            },
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 0, oversized: false }),
+            |_| Ok(()),
+        );
+        assert_eq!(group_fetches.load(Ordering::Relaxed), 1, "idle local tick must not fork getent");
+
+        // Changing /etc/group triggers an immediate refresh on the next tick.
+        g.tick_with(
+            &mut state,
+            t0 + RECHECK * 2,
+            stamp2,
+            || {
+                group_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::Found(grp.clone()))
+            },
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 0, oversized: false }),
+            |_| Ok(()),
+        );
+        assert_eq!(group_fetches.load(Ordering::Relaxed), 2);
+
+        // After IDLE_LOCAL_NSS_REFRESH, an idle refresh runs even without /etc/group edits.
+        g.tick_with(
+            &mut state,
+            t0 + RECHECK * 2 + IDLE_LOCAL_NSS_REFRESH,
+            stamp2,
+            || {
+                group_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(LookupResult::Found(grp.clone()))
+            },
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 0, oversized: false }),
+            |_| Ok(()),
+        );
+        assert_eq!(group_fetches.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn tick_recovers_acl_after_boot_outage_and_detects_offline_uid_changes() {
+        let g = gate();
+        let mut state = AclState::default();
+        let t0 = Instant::now();
+        let stamp = Some(FileStamp { dev: 1, ino: 1, len: 100, mtime_sec: 1, mtime_nsec: 0 });
+        let grp = Group { name: c"kiri".to_owned(), gid: 998, members: vec![c"local".to_owned(), c"alice".to_owned()] };
+        let writes: Mutex<Vec<Vec<u32>>> = Mutex::default();
+
+        // 1. Boot before sssd: alice is unresolved (exit 2); local uid is written, state does not freeze.
+        g.tick_with(
+            &mut state,
+            t0,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 1, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(writes.lock().unwrap().last().unwrap(), &vec![1001]);
+
+        // 2. sssd comes up on the next tick: alice resolves to 5001 and ACL updates automatically.
+        let t1 = t0 + RECHECK;
+        g.tick_with(
+            &mut state,
+            t1,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001, 5001], directory_members: 1, unresolved: 0, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(writes.lock().unwrap().last().unwrap(), &vec![1001, 5001]);
+
+        // 3. Brief transient exit-2 outage does NOT shrink the existing ACL.
+        let t2 = t1 + IDLE_DIRECTORY_REFRESH;
+        g.tick_with(
+            &mut state,
+            t2,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 1, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(state.uids, Some(vec![1001, 5001]), "single exit-2 miss must not shrink ACL");
+        assert_eq!(writes.lock().unwrap().len(), 2);
+
+        // 4. Offline UID reassignment (closed == 0, same group.members): alice now has uid 5099.
+        let t3 = t2 + RECHECK;
+        g.tick_with(
+            &mut state,
+            t3,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001, 5099], directory_members: 1, unresolved: 0, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(writes.lock().unwrap().last().unwrap(), &vec![1001, 5099]);
+
+        // 5. Offline deletion (closed == 0): after DIRECTORY_MISS_GRACE consecutive misses, stale uid 5099 is removed.
+        let mut t = t3 + IDLE_DIRECTORY_REFRESH;
+        for step in 1..=DIRECTORY_MISS_GRACE {
+            g.tick_with(
+                &mut state,
+                t,
+                stamp,
+                || Ok(LookupResult::Found(grp.clone())),
+                |_, _| Ok(Membership::Allowed),
+                |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 1, oversized: false }),
+                |u| {
+                    writes.lock().unwrap().push(u.to_vec());
+                    Ok(())
+                },
+            );
+            if step < DIRECTORY_MISS_GRACE {
+                assert_eq!(state.uids, Some(vec![1001, 5099]), "kept during grace tick {step}");
+            }
+            t += RECHECK;
+        }
+        assert_eq!(state.uids, Some(vec![1001]), "removed after grace expires");
+        assert_eq!(writes.lock().unwrap().last().unwrap(), &vec![1001]);
+    }
+
+    #[test]
+    fn sweep_survives_transient_directory_exit2_and_closes_permanent_removal() {
+        let g = gate();
+        let (a, _b) = UnixStream::pair().unwrap();
+        let _seat = g.admit_with(&a, |_| Ok(true)).unwrap();
+
+        // Transient exit-2 misses below DIRECTORY_MISS_GRACE keep the connection open.
+        for _ in 1..DIRECTORY_MISS_GRACE {
+            assert!(g.sweep_membership_with(|_| Ok(Membership::MissingFromDirectory)).is_empty());
+            assert_eq!(g.open.lock().unwrap().len(), 1);
+        }
+        // Recovery resets the miss streak.
+        assert!(g.sweep_membership_with(|_| Ok(Membership::Allowed)).is_empty());
+        assert_eq!(g.open.lock().unwrap().len(), 1);
+
+        // Consecutive misses reaching DIRECTORY_MISS_GRACE close the connection.
+        for _ in 1..DIRECTORY_MISS_GRACE {
+            assert!(g.sweep_membership_with(|_| Ok(Membership::MissingFromDirectory)).is_empty());
+        }
+        let closed = g.sweep_membership_with(|_| Ok(Membership::MissingFromDirectory));
+        assert_eq!(closed.len(), 1);
+        assert!(g.open.lock().unwrap().is_empty());
+
+        // Confirmed revocation closes immediately on the first tick.
+        let (c, _d) = UnixStream::pair().unwrap();
+        let _seat2 = g.admit_with(&c, |_| Ok(true)).unwrap();
+        assert_eq!(g.sweep_membership_with(|_| Ok(Membership::Revoked)).len(), 1);
+        assert!(g.open.lock().unwrap().is_empty());
     }
 }
