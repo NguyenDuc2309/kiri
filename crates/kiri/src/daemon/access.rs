@@ -34,6 +34,10 @@ use std::time::{Duration, Instant};
 
 /// How often the people still connected are checked again.
 const RECHECK: Duration = Duration::from_secs(2);
+/// How long a single `getent` call may run before it is killed.
+const GETENT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Maximum stdout accepted from a single `getent` call.
+const GETENT_MAX_STDOUT: usize = 4 * 1024 * 1024;
 
 /// An account or group record and the buffer its strings live in.
 struct Rec<T> {
@@ -156,28 +160,151 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
+enum GetentRaw {
+    /// The `getent` binary does not exist.
+    NoBinary,
+    /// `getent` ran and exited with `(status, stdout)`.
+    Ran(std::process::ExitStatus, Vec<u8>),
+}
+
+/// Runs `program -- <args...>` with a sanitized environment, bounded duration,
+/// and bounded stdout capture. Kills the child process group and reaps it on
+/// timeout or oversized output.
+fn exec_getent(program: &Path, args: &[&OsStr], timeout: Duration, max_bytes: usize) -> io::Result<GetentRaw> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(program);
+    cmd.env_clear()
+        .env("LC_ALL", "C")
+        .arg("--")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(GetentRaw::NoBinary),
+        Err(e) => return Err(e),
+    };
+
+    let kill_and_reap = |child: &mut std::process::Child| {
+        let pid = child.id();
+        if pid > 0 && pid <= i32::MAX as u32 {
+            // SAFETY: child has not been waited yet and leads its own process group.
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let fd = stdout.as_raw_fd();
+    // SAFETY: fd is an open pipe descriptor owned by `stdout`.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let err = io::Error::last_os_error();
+        drop(stdout);
+        kill_and_reap(&mut child);
+        return Err(err);
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut eof = false;
+
+    while !eof {
+        let now = Instant::now();
+        if now >= deadline {
+            drop(stdout);
+            kill_and_reap(&mut child);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("getent timed out after {}ms", timeout.as_millis())));
+        }
+        let rem_ms = deadline.saturating_duration_since(now).as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: `pfd` points to one valid `pollfd` struct.
+        let ready = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            drop(stdout);
+            kill_and_reap(&mut child);
+            return Err(err);
+        }
+        if ready == 0 {
+            drop(stdout);
+            kill_and_reap(&mut child);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("getent timed out after {}ms", timeout.as_millis())));
+        }
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    if out.len().saturating_add(n) > max_bytes {
+                        drop(stdout);
+                        kill_and_reap(&mut child);
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "getent output exceeded size limit"));
+                    }
+                    out.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    drop(stdout);
+                    kill_and_reap(&mut child);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    drop(stdout);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(GetentRaw::Ran(status, out)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_and_reap(&mut child);
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("getent timed out after {}ms", timeout.as_millis())));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                kill_and_reap(&mut child);
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Runs `program -- <db> <key>`, returning `Ok(Some(stdout))` on exit 0,
 /// `Ok(None)` on exit 2 (no such key) or missing binary, and `Err` otherwise.
 fn run_getent(program: &Path, db: &str, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    run_getent_with_limits(program, db, key, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
+}
+
+fn run_getent_with_limits(program: &Path, db: &str, key: &[u8], timeout: Duration, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
     if !valid_key(key) {
         return Ok(None);
     }
-    let out = match std::process::Command::new(program)
-        .args(["--", db])
-        .arg(OsStr::from_bytes(key))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    match out.status.code() {
-        Some(0) => Ok(Some(out.stdout)),
-        // 2: no such key.
-        Some(2) => Ok(None),
-        _ => Err(io::Error::other(format!("getent {db} {}: {}", String::from_utf8_lossy(key), out.status))),
+    let args = [OsStr::new(db), OsStr::from_bytes(key)];
+    match exec_getent(program, &args, timeout, max_bytes)? {
+        GetentRaw::NoBinary => Ok(None),
+        GetentRaw::Ran(status, stdout) => match status.code() {
+            Some(0) => Ok(Some(stdout)),
+            // 2: no such key.
+            Some(2) => Ok(None),
+            _ => Err(io::Error::other(format!("getent {db} {}: {status}", String::from_utf8_lossy(key)))),
+        },
     }
 }
 
@@ -191,7 +318,11 @@ fn getent_account(key: &[u8]) -> io::Result<Option<Account>> {
 }
 
 fn getent_account_with(program: &Path, key: &[u8]) -> io::Result<Option<Account>> {
-    let Some(stdout) = run_getent(program, "passwd", key)? else { return Ok(None) };
+    getent_account_with_limits(program, key, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
+}
+
+fn getent_account_with_limits(program: &Path, key: &[u8], timeout: Duration, max_bytes: usize) -> io::Result<Option<Account>> {
+    let Some(stdout) = run_getent_with_limits(program, "passwd", key, timeout, max_bytes)? else { return Ok(None) };
     passwd_line(&stdout)
         .map(Some)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent passwd output for {}", String::from_utf8_lossy(key))))
@@ -218,30 +349,27 @@ fn initgroups_has(user: &CStr, gid: u32) -> io::Result<bool> {
 }
 
 fn initgroups_has_with(program: &Path, user: &CStr, gid: u32) -> io::Result<bool> {
+    initgroups_has_with_limits(program, user, gid, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
+}
+
+fn initgroups_has_with_limits(program: &Path, user: &CStr, gid: u32, timeout: Duration, max_bytes: usize) -> io::Result<bool> {
     let key = user.to_bytes();
     if !valid_key(key) {
         return Ok(false);
     }
-    let out = match std::process::Command::new(program)
-        .args(["--", "initgroups"])
-        .arg(OsStr::from_bytes(key))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    match out.status.code() {
-        Some(0) => {
-            let gids = initgroups_line(&out.stdout, key)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent initgroups output for {}", user.to_string_lossy())))?;
-            Ok(gids.contains(&gid))
-        }
-        // 1: database unknown (non-glibc getent); 2: no such key.
-        Some(1 | 2) => Ok(false),
-        _ => Err(io::Error::other(format!("getent initgroups {}: {}", user.to_string_lossy(), out.status))),
+    let args = [OsStr::new("initgroups"), OsStr::from_bytes(key)];
+    match exec_getent(program, &args, timeout, max_bytes)? {
+        GetentRaw::NoBinary => Ok(false),
+        GetentRaw::Ran(status, stdout) => match status.code() {
+            Some(0) => {
+                let gids = initgroups_line(&stdout, key)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent initgroups output for {}", user.to_string_lossy())))?;
+                Ok(gids.contains(&gid))
+            }
+            // 1: database unknown (non-glibc getent); 2: no such key.
+            Some(1 | 2) => Ok(false),
+            _ => Err(io::Error::other(format!("getent initgroups {}: {status}", user.to_string_lossy()))),
+        },
     }
 }
 
@@ -1089,5 +1217,107 @@ mod tests {
         };
         assert_eq!(uids_of_with(&group, by_name).unwrap(), vec![1001, 5001]);
         assert!(uids_of_with(&group, |_| Err(io::Error::other("directory unavailable"))).is_err());
+    }
+
+    fn write_test_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn make_temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("kiri-access-{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn getent_runs_with_clean_environment() {
+        let dir = make_temp_dir("env");
+        let env_passwd = dir.join("env-passwd");
+        let env_init = dir.join("env-init");
+        let prog = write_test_script(
+            &dir,
+            "fake-getent",
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = \"--\" ] || exit 9\n\
+                 shift\n\
+                 case \"$1\" in\n\
+                   passwd) export -p > \"{}\"; echo 'alice:x:5001:5001::/:/bin/sh'; exit 0 ;;\n\
+                   initgroups) export -p > \"{}\"; echo 'alice 998'; exit 0 ;;\n\
+                   *) exit 2 ;;\n\
+                 esac\n",
+                env_passwd.display(),
+                env_init.display(),
+            ),
+        );
+
+        assert!(getent_account_with(&prog, b"alice").unwrap().is_some());
+        assert!(initgroups_has_with(&prog, c"alice", 998).unwrap());
+
+        for dump in [&env_passwd, &env_init] {
+            let text = std::fs::read_to_string(dump).unwrap();
+            let mut saw_lc_all = false;
+            for line in text.lines() {
+                let rest = line.strip_prefix("export ").unwrap_or(line);
+                let (k, v) = rest.split_once('=').unwrap_or((rest, ""));
+                if k == "LC_ALL" {
+                    assert!(v == "'C'" || v == "C" || v == "\"C\"", "unexpected LC_ALL: {line}");
+                    saw_lc_all = true;
+                } else {
+                    assert!(matches!(k, "PWD" | "SHLVL" | "_"), "unexpected inherited env var in getent: {line}");
+                }
+            }
+            assert!(saw_lc_all, "LC_ALL=C not set in {text}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn getent_times_out_and_caps_stdout() {
+        let dir = make_temp_dir("limits");
+        let prog = write_test_script(
+            &dir,
+            "fake-getent",
+            "#!/bin/sh\n\
+             [ \"$1\" = \"--\" ] || exit 9\n\
+             shift\n\
+             case \"$2\" in\n\
+               hang) [ -x /bin/sleep ] && /bin/sleep 30 || /usr/bin/sleep 30; exit 0 ;;\n\
+               hang_closed) exec >&-; [ -x /bin/sleep ] && /bin/sleep 30 || /usr/bin/sleep 30; exit 0 ;;\n\
+               flood)\n\
+                 line='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n\
+                 i=0; while [ \"$i\" -lt 64 ]; do printf '%s\\n' \"$line\"; i=$((i+1)); done\n\
+                 exit 0 ;;\n\
+               *) exit 2 ;;\n\
+             esac\n",
+        );
+
+        let limit = Duration::from_millis(150);
+        let t0 = Instant::now();
+        let err = getent_account_with_limits(&prog, b"hang", limit, GETENT_MAX_STDOUT).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(t0.elapsed() < Duration::from_secs(3), "hung passwd lookup took {:?}", t0.elapsed());
+
+        let t1 = Instant::now();
+        let err = initgroups_has_with_limits(&prog, c"hang", 998, limit, GETENT_MAX_STDOUT).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(t1.elapsed() < Duration::from_secs(3), "hung initgroups lookup took {:?}", t1.elapsed());
+
+        let t2 = Instant::now();
+        let err = getent_account_with_limits(&prog, b"hang_closed", limit, GETENT_MAX_STDOUT).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(t2.elapsed() < Duration::from_secs(3), "closed-stdout hang took {:?}", t2.elapsed());
+
+        let err = getent_account_with_limits(&prog, b"flood", Duration::from_secs(3), 256).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
