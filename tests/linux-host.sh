@@ -406,66 +406,248 @@ t fwdrop-nft-warning-gone "gone" "docker info --format '{{json .Warnings}}' | gr
 t fwdrop-flush-rebuilt "Example Domain" "nft flush ruleset; sleep 1; docker run --rm alpine wget -qO- -T 10 http://example.com"
 t fwdrop-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del vm; ip link del virbr0; echo ok"
 # Directory accounts and NSS groups outside /etc/passwd and /etc/group (#349):
-# the static engine falls back to getent, admits members of the configured
-# group (local, directory, initgroups-only, and NSS-only groups), refuses
-# non-members and unknown uids, and revokes removed accounts.
+# the static engine uses getent (with clean env and bounded duration), admits
+# local, directory, merged local+NSS, initgroups-only (including high signed
+# GIDs), host-access canonicalized, and NSS-only group members, refuses
+# non-members and unknown uids, survives transient exit-2 outages without
+# losing ACLs or live connections, and revokes removed accounts with open
+# connections even while another user's getent lookup hangs.
 $D exec -i "$N" sh -c 'cat > /access-test.sh' <<'SH'
 #!/bin/sh
 set -u
 had_getent=1
 [ -e /usr/bin/getent ] || { had_getent=0; : > /usr/bin/getent; }
+had_gpasswd=1
+[ -e /usr/bin/gpasswd ] || { had_gpasswd=0; : > /usr/bin/gpasswd; }
 out=$(unshare --mount --propagation private --net --fork sh -c '
   set -u
   mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && mount -t tmpfs t /dev/shm && ip link set lo up
-  mkdir -p /dev/shm/acc && chmod 755 /dev/shm/acc
+  mkdir -p /dev/shm/acc /dev/shm/acc/run && chmod 755 /dev/shm/acc /dev/shm/acc/run
+  mount --bind /dev/shm/acc/run /run
+  mkdir -p /run/kiri && chmod 755 /run/kiri
   cp /etc/passwd /dev/shm/acc/passwd && cp /etc/group /dev/shm/acc/group
   echo "klocal349:x:21001:21001::/:/sbin/nologin" >> /dev/shm/acc/passwd
   echo "kgrp349:x:21100:klocal349,kdir349" >> /dev/shm/acc/group
+  echo "kiri:x:21300:" >> /dev/shm/acc/group
   mount --bind /dev/shm/acc/passwd /etc/passwd
   mount --bind /dev/shm/acc/group /etc/group
   cat > /dev/shm/acc/getent <<"GE"
 #!/bin/sh
+[ -z "${LD_PRELOAD:-}" ] || exit 9
 [ "$1" = "--" ] && shift
-case "$1:$2" in
-  passwd:kdir349|passwd:21002) echo "kdir349:x:21002:21002::/:/bin/sh"; exit 0 ;;
-  passwd:kinit349|passwd:21003) echo "kinit349:x:21003:21003::/:/bin/sh"; exit 0 ;;
-  passwd:kout349|passwd:21004) echo "kout349:x:21004:21004::/:/bin/sh"; exit 0 ;;
-  group:knssgrp349) echo "knssgrp349:x:21200:klocal349,kdir349"; exit 0 ;;
-  initgroups:kinit349) echo "kinit349 21100"; exit 0 ;;
-  initgroups:kdir349|initgroups:kout349|initgroups:klocal349) echo "$2"; exit 0 ;;
+db="$1"; shift
+etc_lookup() {
+  file="$1"; want="$2"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$want":*) printf "%s\n" "$line"; return 0 ;;
+    esac
+  done < "$file"
+  return 1
+}
+hang() {
+  [ -x /bin/sleep ] && exec /bin/sleep 60 || exec /usr/bin/sleep 60
+}
+[ -f /dev/shm/acc/hang-all ] && hang
+case "$db" in
+  passwd)
+    rc=0
+    for key in "$@"; do
+      if [ -f /dev/shm/acc/hang-dir ] && { [ "$key" = kdir349 ] || [ "$key" = 21002 ]; }; then hang; fi
+      if [ -f /dev/shm/acc/outage-dir ] && { [ "$key" = kdir349 ] || [ "$key" = 21002 ]; }; then rc=2; continue; fi
+      case "$key" in
+        kdir349|21002) echo "kdir349:x:21002:21002::/:/bin/sh" ;;
+        kinit349|21003) echo "kinit349:x:21003:21003::/:/bin/sh" ;;
+        kout349|21004) echo "kout349:x:21004:21004::/:/bin/sh" ;;
+        KCanon349|kcanon349|kcanon349@corp.example|21005) echo "kcanon349@corp.example:x:21005:21005::/:/bin/sh" ;;
+        kmerged349|21006) echo "kmerged349:x:21006:21006::/:/bin/sh" ;;
+        *)
+          if line=$(etc_lookup /etc/passwd "$key"); then printf "%s\n" "$line"; else rc=2; fi ;;
+      esac
+    done
+    exit "$rc" ;;
+  group)
+    rc=0
+    for key in "$@"; do
+      case "$key" in
+        kgrp349)
+          if line=$(etc_lookup /etc/group kgrp349); then
+            case "$line" in
+              *:) printf "%skmerged349\n" "$line" ;;
+              *)  printf "%s,kmerged349\n" "$line" ;;
+            esac
+          else
+            rc=2
+          fi ;;
+        knssgrp349) echo "knssgrp349:x:21200:klocal349,kdir349" ;;
+        *)
+          if line=$(etc_lookup /etc/group "$key"); then printf "%s\n" "$line"; else rc=2; fi ;;
+      esac
+    done
+    exit "$rc" ;;
+  initgroups)
+    key="$1"
+    if [ -f /dev/shm/acc/hang-dir ] && [ "$key" = kdir349 ]; then hang; fi
+    if [ -f /dev/shm/acc/outage-dir ] && [ "$key" = kdir349 ]; then exit 2; fi
+    case "$key" in
+      kinit349) echo "kinit349 -1000 21100"; exit 0 ;;
+      kdir349|kout349|klocal349|kmerged349|kcanon349@corp.example) echo "$key"; exit 0 ;;
+      *) exit 2 ;;
+    esac ;;
   *) exit 2 ;;
 esac
 GE
   chmod 755 /dev/shm/acc/getent
   mount --bind /dev/shm/acc/getent /usr/bin/getent
+  cat > /dev/shm/acc/gpasswd <<"GP"
+#!/bin/sh
+[ -z "${LD_PRELOAD:-}" ] || exit 9
+[ "$1" = "-a" ] || exit 2
+user="$2"; grp="$3"
+out=""
+found=0
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    "$grp":*)
+      found=1
+      case "$line" in
+        *:) line="${line}${user}" ;;
+        *)  line="${line},${user}" ;;
+      esac ;;
+  esac
+  out="${out}${line}
+"
+done < /etc/group
+[ "$found" = 1 ] || exit 1
+printf "%s" "$out" > /etc/group
+exit 0
+GP
+  chmod 755 /dev/shm/acc/gpasswd
+  mount --bind /dev/shm/acc/gpasswd /usr/bin/gpasswd
   ping() {
-    sock=$1; uid=$2; gid=$3; grp=${4:-}
+    sock=$1; uid=$2; gid=$3; grp=${4:-}; max=${5:-3}
     if [ -n "$grp" ]; then
-      code=$(setpriv --reuid="$uid" --regid="$gid" --groups="$grp" curl -s -m 3 -o /dev/null -w "%{http_code}" --unix-socket "$sock" http://d/_ping 2>/dev/null)
+      code=$(setpriv --reuid="$uid" --regid="$gid" --groups="$grp" curl -s -m "$max" -o /dev/null -w "%{http_code}" --unix-socket "$sock" http://d/_ping 2>/dev/null)
     else
-      code=$(setpriv --reuid="$uid" --regid="$gid" --clear-groups curl -s -m 3 -o /dev/null -w "%{http_code}" --unix-socket "$sock" http://d/_ping 2>/dev/null)
+      code=$(setpriv --reuid="$uid" --regid="$gid" --clear-groups curl -s -m "$max" -o /dev/null -w "%{http_code}" --unix-socket "$sock" http://d/_ping 2>/dev/null)
     fi
     echo "${code:-000}"
   }
+  cat > /dev/shm/acc/hold.py <<"PY"
+import socket, sys
+sock, st = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(sock)
+    s.sendall(b"GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n")
+    data = s.recv(512)
+    if b" 200 " not in data:
+        open(st, "w").write("denied")
+        sys.exit(1)
+    open(st, "w").write("ready")
+    s.settimeout(40)
+    while True:
+        chunk = s.recv(64)
+        if not chunk:
+            open(st, "w").write("closed")
+            sys.exit(0)
+except Exception:
+    open(st, "w").write("closed")
+PY
+  hold_conn() {
+    sock=$1; uid=$2; gid=$3; st=$4
+    : > "$st"
+    chmod 666 "$st"
+    setpriv --reuid="$uid" --regid="$gid" --clear-groups python3 /dev/shm/acc/hold.py "$sock" "$st" >/dev/null 2>&1 &
+    echo $!
+  }
+  wait_state() {
+    st=$1; want=$2; tries=$3
+    for _ in $(seq "$tries"); do
+      [ "$(cat "$st" 2>/dev/null)" = "$want" ] && return 0
+      sleep 0.25
+    done
+    return 1
+  }
+  set_grp() {
+    grep -v "^kgrp349:" /etc/group > /dev/shm/acc/group.new
+    echo "kgrp349:x:21100:$1" >> /dev/shm/acc/group.new
+    cat /dev/shm/acc/group.new > /etc/group
+  }
+  # 1. Start daemon during a transient exit-2 outage for kdir349.
+  KIRI_BIN=${KIRI_BIN:-/opt/kiri/kiri}
+  touch /dev/shm/acc/outage-dir
   S1=/dev/shm/acc/loc.sock
   mkdir -p /dev/shm/acc/h1
-  HOME=/dev/shm/acc/h1 KIRI_SOCKET=$S1 KIRI_SOCKET_GROUP=kgrp349 /opt/kiri/kiri daemon >/dev/shm/acc/d1.log 2>&1 &
+  LD_PRELOAD=/nonexistent/kiri-test.so HOME=/dev/shm/acc/h1 KIRI_SOCKET=$S1 KIRI_SOCKET_GROUP=kgrp349 "$KIRI_BIN" daemon >/dev/shm/acc/d1.log 2>&1 &
   P1=$!
   for i in $(seq 80); do [ -S "$S1" ] && [ "$(ping "$S1" 0 0)" = 200 ] && break; sleep 0.2; done
   r_local=$(ping "$S1" 21001 21001)
-  r_dir=$(ping "$S1" 21002 21002)
+  r_merged=$(ping "$S1" 21006 21006)
   r_init=$(ping "$S1" 21003 21003 21100)
   r_out=$(ping "$S1" 21004 21004 21100)
   r_unk=$(ping "$S1" 21099 21099 21100)
-  grep -v "^kgrp349:" /etc/group > /dev/shm/acc/group.new
-  echo "kgrp349:x:21100:klocal349" >> /dev/shm/acc/group.new
-  cat /dev/shm/acc/group.new > /etc/group
-  sleep 3
+  # Outage clears: kdir349 must recover its socket ACL automatically.
+  rm -f /dev/shm/acc/outage-dir
+  r_boot=000
+  for i in $(seq 24); do
+    r_boot=$(ping "$S1" 21002 21002)
+    [ "$r_boot" = 200 ] && break
+    sleep 0.25
+  done
+  # 2. Live directory connection survives a brief exit-2 outage.
+  C_DIR=$(hold_conn "$S1" 21002 21002 /dev/shm/acc/st-dir)
+  if wait_state /dev/shm/acc/st-dir ready 20; then
+    touch /dev/shm/acc/outage-dir
+    sleep 2.8
+    rm -f /dev/shm/acc/outage-dir
+    if [ "$(cat /dev/shm/acc/st-dir)" = ready ]; then r_outage=open; else r_outage=closed; fi
+    sleep 2.5
+  else
+    r_outage=no-conn
+  fi
+  # 3. Removed user with an open connection is closed even while getent hangs on another user.
+  C_LOC=$(hold_conn "$S1" 21001 21001 /dev/shm/acc/st-loc)
+  if wait_state /dev/shm/acc/st-loc ready 20; then
+    touch /dev/shm/acc/hang-dir
+    set_grp "kdir349"
+    if wait_state /dev/shm/acc/st-loc closed 40; then r_hang_close=closed; else r_hang_close=stuck; fi
+  else
+    r_hang_close=no-conn
+  fi
+  kill "$C_LOC" 2>/dev/null; wait "$C_LOC" 2>/dev/null
+  # 4. Global hung getent fails new uncached connections promptly instead of hanging.
+  touch /dev/shm/acc/hang-all
+  t0=$(date +%s)
+  r_hn_code=$(ping "$S1" 21098 21098 21100 12)
+  dt=$(($(date +%s) - t0))
+  if [ "$r_hn_code" = 000 ] && [ "$dt" -lt 9 ]; then r_hang_new=000-fast; else r_hang_new="${r_hn_code}-${dt}s"; fi
+  rm -f /dev/shm/acc/hang-all /dev/shm/acc/hang-dir
+  # 5. Removing kdir349 closes its open connection and refuses new ones.
+  set_grp ""
+  if wait_state /dev/shm/acc/st-dir closed 48; then r_rev_open=closed; else r_rev_open=stuck; fi
+  kill "$C_DIR" 2>/dev/null; wait "$C_DIR" 2>/dev/null
   r_rev=$(ping "$S1" 21002 21002 21100)
   kill "$P1" 2>/dev/null; wait "$P1" 2>/dev/null
+  # 6. kiri host-access with a canonicalized directory account.
+  S3=/run/kiri/docker.sock
+  mkdir -p /dev/shm/acc/h3
+  HOME=/dev/shm/acc/h3 KIRI_SOCKET=$S3 KIRI_SOCKET_GROUP=kiri "$KIRI_BIN" daemon >/dev/shm/acc/d3.log 2>&1 &
+  P3=$!
+  for i in $(seq 80); do [ -S "$S3" ] && [ "$(ping "$S3" 0 0)" = 200 ] && break; sleep 0.2; done
+  if LD_PRELOAD=/nonexistent/kiri-test.so "$KIRI_BIN" host-access KCanon349 >/dev/shm/acc/ha.log 2>&1; then
+    r_ha=0
+  else
+    r_ha=1
+  fi
+  if grep -q "^kiri:.*kcanon349@corp.example" /etc/group; then r_ha_name=canon; else r_ha_name=raw; fi
+  r_canon=$(ping "$S3" 21005 21005)
+  kill "$P3" 2>/dev/null; wait "$P3" 2>/dev/null
+  # 7. NSS-only group outside /etc/group.
   S2=/dev/shm/acc/nss.sock
   mkdir -p /dev/shm/acc/h2
-  HOME=/dev/shm/acc/h2 KIRI_SOCKET=$S2 KIRI_SOCKET_GROUP=knssgrp349 /opt/kiri/kiri daemon >/dev/shm/acc/d2.log 2>&1 &
+  HOME=/dev/shm/acc/h2 KIRI_SOCKET=$S2 KIRI_SOCKET_GROUP=knssgrp349 "$KIRI_BIN" daemon >/dev/shm/acc/d2.log 2>&1 &
   P2=$!
   for i in $(seq 40); do kill -0 "$P2" 2>/dev/null || break; [ -S "$S2" ] && [ "$(ping "$S2" 0 0)" = 200 ] && break; sleep 0.2; done
   if [ -S "$S2" ] && [ "$(ping "$S2" 0 0)" = 200 ]; then
@@ -476,12 +658,13 @@ GE
     r_nl=down; r_nd=down; r_no=down
   fi
   kill "$P2" 2>/dev/null; wait "$P2" 2>/dev/null
-  echo "local=$r_local dir=$r_dir init=$r_init out=$r_out unk=$r_unk rev=$r_rev nss-local=$r_nl nss-dir=$r_nd nss-out=$r_no"
+  echo "local=$r_local merged=$r_merged init=$r_init out=$r_out unk=$r_unk boot=$r_boot outage=$r_outage hang-close=$r_hang_close hang-new=$r_hang_new rev-open=$r_rev_open rev=$r_rev ha=$r_ha ha-name=$r_ha_name canon=$r_canon nss-local=$r_nl nss-dir=$r_nd nss-out=$r_no"
 ')
 [ "$had_getent" = 0 ] && rm -f /usr/bin/getent
+[ "$had_gpasswd" = 0 ] && rm -f /usr/bin/gpasswd
 echo "$out"
 SH
-t access-directory-accounts "local=200 dir=200 init=200 out=000 unk=000 rev=000 nss-local=200 nss-dir=200 nss-out=000" "apk add -q util-linux util-linux-misc iproute2 >/dev/null 2>&1; sh /access-test.sh"
+t access-directory-accounts "local=200 merged=200 init=200 out=000 unk=000 boot=200 outage=open hang-close=closed hang-new=000-fast rev-open=closed rev=000 ha=0 ha-name=canon canon=200 nss-local=200 nss-dir=200 nss-out=000" "apk add -q util-linux util-linux-misc iproute2 shadow >/dev/null 2>&1; sh /access-test.sh"
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
 # where the kernel refuses mknod of a device: an image layer with a
