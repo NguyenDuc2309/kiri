@@ -1000,6 +1000,8 @@ struct AclState {
     has_unresolved: bool,
     /// Consecutive ticks with unresolved members (or exit-2 group).
     unresolved_streak: u32,
+    /// Consecutive ticks where unresolved lookups would drop an existing non-closed ACL UID.
+    shrink_streak: u32,
     /// Member list for which ACL writes permanently failed or exceeded limits.
     skipped_for_names: Option<Vec<CString>>,
     /// Timestamp of the last successful `fetch_group()`.
@@ -1015,6 +1017,11 @@ struct AclState {
 impl AclState {
     fn initialized(&self) -> bool {
         self.uids.is_some() || self.skipped_for_names.is_some()
+    }
+
+    fn fast_retry(&self) -> bool {
+        (self.has_unresolved && self.unresolved_streak < DIRECTORY_MISS_GRACE)
+            || (self.shrink_streak > 0 && self.shrink_streak < DIRECTORY_MISS_GRACE)
     }
 }
 
@@ -1190,15 +1197,12 @@ impl Gate {
 
         // Avoid idle `getent` forks when nobody is connected, `/etc/group` is
         // unchanged, and no unresolved directory members need fast retry.
-        if !connected && !stamp_changed && state.initialized() {
-            let fast_unresolved = state.has_unresolved && state.unresolved_streak < DIRECTORY_MISS_GRACE;
-            if !fast_unresolved {
-                let interval = if state.has_directory || state.has_unresolved { IDLE_DIRECTORY_REFRESH } else { IDLE_LOCAL_NSS_REFRESH };
-                if let Some(last) = state.last_group_fetch
-                    && now.saturating_duration_since(last) < interval
-                {
-                    return;
-                }
+        if !connected && !stamp_changed && state.initialized() && !state.fast_retry() {
+            let interval = if state.has_directory || state.has_unresolved { IDLE_DIRECTORY_REFRESH } else { IDLE_LOCAL_NSS_REFRESH };
+            if let Some(last) = state.last_group_fetch
+                && now.saturating_duration_since(last) < interval
+            {
+                return;
             }
         }
 
@@ -1226,6 +1230,7 @@ impl Gate {
         match group {
             LookupResult::NotFound => {
                 state.unresolved_streak = 0;
+                state.shrink_streak = 0;
                 state.has_directory = false;
                 state.has_unresolved = false;
                 state.skipped_for_names = None;
@@ -1252,8 +1257,13 @@ impl Gate {
                 // ACL on a single transient outage; clear only after grace.
                 state.has_unresolved = true;
                 state.unresolved_streak = state.unresolved_streak.saturating_add(1);
-                let existing_nonempty = state.uids.as_ref().is_some_and(|u| !u.is_empty());
-                if existing_nonempty && state.unresolved_streak < DIRECTORY_MISS_GRACE {
+                let shrinking = state.uids.as_ref().is_some_and(|prev| prev.iter().any(|u| !closed_uids.contains(u)));
+                if shrinking {
+                    state.shrink_streak = state.shrink_streak.saturating_add(1);
+                } else {
+                    state.shrink_streak = 0;
+                }
+                if shrinking && state.shrink_streak < DIRECTORY_MISS_GRACE {
                     return;
                 }
                 if state.uids.as_deref() == Some(&[]) {
@@ -1265,10 +1275,12 @@ impl Gate {
                         crate::diag::info!("socket access list written", members = 0);
                         state.names = Some(Vec::new());
                         state.uids = Some(Vec::new());
+                        state.shrink_streak = 0;
                     }
                     Err(e) if acl_permanent_err(&e) => {
                         state.names = Some(Vec::new());
                         state.skipped_for_names = Some(Vec::new());
+                        state.shrink_streak = 0;
                     }
                     Err(e) => crate::diag::warn!("socket access list not written", error = e),
                 }
@@ -1285,7 +1297,7 @@ impl Gate {
                 let refresh_due = !state.initialized()
                     || names_changed
                     || !closed_uids.is_empty()
-                    || (state.has_unresolved && state.unresolved_streak < DIRECTORY_MISS_GRACE)
+                    || state.fast_retry()
                     || ((state.has_directory || state.has_unresolved) && state.last_resolve.is_none_or(|t| now.saturating_duration_since(t) >= IDLE_DIRECTORY_REFRESH));
 
                 if !refresh_due {
@@ -1316,6 +1328,7 @@ impl Gate {
                     state.uids = Some(Vec::new());
                     state.skipped_for_names = Some(now_names);
                     state.unresolved_streak = 0;
+                    state.shrink_streak = 0;
                     return;
                 }
 
@@ -1325,7 +1338,15 @@ impl Gate {
                     state.unresolved_streak = 0;
                 }
 
-                let effective_uids = if resolved.unresolved > 0 && state.unresolved_streak < DIRECTORY_MISS_GRACE {
+                let shrinking = resolved.unresolved > 0
+                    && state.uids.as_ref().is_some_and(|prev| prev.iter().any(|u| !closed_uids.contains(u) && !resolved.uids.contains(u)));
+                if shrinking {
+                    state.shrink_streak = state.shrink_streak.saturating_add(1);
+                } else {
+                    state.shrink_streak = 0;
+                }
+
+                let effective_uids = if shrinking && state.shrink_streak < DIRECTORY_MISS_GRACE {
                     if let Some(prev) = &state.uids {
                         let mut merged: Vec<u32> = prev.iter().copied().filter(|u| !closed_uids.contains(u)).collect();
                         merged.extend(resolved.uids.iter().copied());
@@ -1353,6 +1374,9 @@ impl Gate {
                         state.uids = Some(effective_uids);
                         state.skipped_for_names = None;
                         state.warned_skip = false;
+                        if state.shrink_streak >= DIRECTORY_MISS_GRACE {
+                            state.shrink_streak = 0;
+                        }
                     }
                     Err(e) if acl_too_large(&e) => {
                         let _ = write_acl(&[]);
@@ -1363,10 +1387,12 @@ impl Gate {
                         state.names = Some(now_names.clone());
                         state.uids = Some(Vec::new());
                         state.skipped_for_names = Some(now_names);
+                        state.shrink_streak = 0;
                     }
                     Err(e) if unsupported(&e) => {
                         state.names = Some(now_names.clone());
                         state.skipped_for_names = Some(now_names);
+                        state.shrink_streak = 0;
                     }
                     Err(e) => crate::diag::warn!("socket access list not written", error = e),
                 }
@@ -2836,5 +2862,152 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(g2.lookup.lock().unwrap().waiting, 0);
+    }
+
+    #[test]
+    fn tick_preserves_acl_grace_window_when_another_member_is_permanently_unresolved() {
+        let g = gate();
+        let mut state = AclState::default();
+        let mut t = Instant::now();
+        let stamp = Some(FileStamp { dev: 1, ino: 1, len: 100, mtime_sec: 1, mtime_nsec: 0 });
+        let grp = Group {
+            name: c"kiri".to_owned(),
+            gid: 998,
+            members: vec![c"local".to_owned(), c"alice".to_owned(), c"bob".to_owned(), c"stale".to_owned()],
+        };
+        let writes: Mutex<Vec<Vec<u32>>> = Mutex::default();
+
+        // Saturate unresolved_streak with a permanently unresolved username ("stale").
+        for step in 0..=DIRECTORY_MISS_GRACE {
+            g.tick_with(
+                &mut state,
+                t,
+                stamp,
+                || Ok(LookupResult::Found(grp.clone())),
+                |_, _| Ok(Membership::Allowed),
+                |_| Ok(ResolvedMembers { uids: vec![1001, 5001, 5002], directory_members: 2, unresolved: 1, oversized: false }),
+                |u| {
+                    writes.lock().unwrap().push(u.to_vec());
+                    Ok(())
+                },
+            );
+            t += if step < DIRECTORY_MISS_GRACE { RECHECK } else { IDLE_DIRECTORY_REFRESH };
+        }
+        assert_eq!(state.uids, Some(vec![1001, 5001, 5002]));
+        assert!(state.unresolved_streak >= DIRECTORY_MISS_GRACE);
+        assert_eq!(state.shrink_streak, 0);
+        assert_eq!(writes.lock().unwrap().len(), 1);
+
+        // A transient 1-tick exit-2 outage for alice must still get the full grace window
+        // even though stale already saturated unresolved_streak.
+        g.tick_with(
+            &mut state,
+            t,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001, 5002], directory_members: 1, unresolved: 2, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(state.uids, Some(vec![1001, 5001, 5002]), "transient outage must not drop alice on tick 1");
+        assert_eq!(state.shrink_streak, 1);
+        assert_eq!(writes.lock().unwrap().len(), 1);
+
+        // Fast 2s retry must run while inside the shrink grace window, and recovery resets it.
+        t += RECHECK;
+        let recovered_resolves = AtomicU64::new(0);
+        g.tick_with(
+            &mut state,
+            t,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| {
+                recovered_resolves.fetch_add(1, Ordering::Relaxed);
+                Ok(ResolvedMembers { uids: vec![1001, 5001, 5002], directory_members: 2, unresolved: 1, oversized: false })
+            },
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(recovered_resolves.load(Ordering::Relaxed), 1, "shrink grace must trigger fast 2s retry");
+        assert_eq!(state.shrink_streak, 0);
+        assert_eq!(state.uids, Some(vec![1001, 5001, 5002]));
+
+        // A transient exit-2 on `getent group` must also preserve the ACL despite stale.
+        t += IDLE_DIRECTORY_REFRESH;
+        g.tick_with(
+            &mut state,
+            t,
+            stamp,
+            || Ok(LookupResult::UnavailableOrNotFound),
+            |_, _| Ok(Membership::Allowed),
+            |_| unreachable!(),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(state.uids, Some(vec![1001, 5001, 5002]), "transient group exit-2 must not wipe ACL");
+        assert_eq!(state.shrink_streak, 1);
+        t += RECHECK;
+        g.tick_with(
+            &mut state,
+            t,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001, 5001, 5002], directory_members: 2, unresolved: 1, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(state.shrink_streak, 0);
+
+        // Permanent removal of alice removes 5001 after DIRECTORY_MISS_GRACE consecutive ticks,
+        // and resets shrink grace so a subsequent transient miss for bob still gets grace.
+        t += IDLE_DIRECTORY_REFRESH;
+        for step in 1..=DIRECTORY_MISS_GRACE {
+            g.tick_with(
+                &mut state,
+                t,
+                stamp,
+                || Ok(LookupResult::Found(grp.clone())),
+                |_, _| Ok(Membership::Allowed),
+                |_| Ok(ResolvedMembers { uids: vec![1001, 5002], directory_members: 1, unresolved: 2, oversized: false }),
+                |u| {
+                    writes.lock().unwrap().push(u.to_vec());
+                    Ok(())
+                },
+            );
+            if step < DIRECTORY_MISS_GRACE {
+                assert_eq!(state.uids, Some(vec![1001, 5001, 5002]), "alice kept during grace tick {step}");
+            }
+            t += RECHECK;
+        }
+        assert_eq!(state.uids, Some(vec![1001, 5002]), "alice dropped after grace expires");
+        assert_eq!(state.shrink_streak, 0);
+
+        // Next refresh: transient 1-tick miss for bob must still get its own grace window.
+        t += IDLE_DIRECTORY_REFRESH;
+        g.tick_with(
+            &mut state,
+            t,
+            stamp,
+            || Ok(LookupResult::Found(grp.clone())),
+            |_, _| Ok(Membership::Allowed),
+            |_| Ok(ResolvedMembers { uids: vec![1001], directory_members: 0, unresolved: 3, oversized: false }),
+            |u| {
+                writes.lock().unwrap().push(u.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(state.uids, Some(vec![1001, 5002]), "bob must get a fresh grace window after alice was dropped");
+        assert_eq!(state.shrink_streak, 1);
     }
 }
