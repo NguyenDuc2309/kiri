@@ -85,6 +85,48 @@ fn add_member_with(user: &str, group: &str, usermod: Option<&Path>, gpasswd: Opt
     Err(io::Error::other(usermod_err.unwrap_or_else(|| "neither usermod nor gpasswd found in system directories".into())))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_with(
+    user: &str,
+    group: &str,
+    resolve_account: impl Fn(&str) -> io::Result<Option<String>>,
+    list_members: impl Fn(&str) -> io::Result<Vec<String>>,
+    create_group: impl Fn(&str) -> io::Result<()>,
+    add_member: impl Fn(&str, &str) -> io::Result<()>,
+    start_engine: impl Fn() -> io::Result<()>,
+    grant_acl: impl Fn(&str) -> io::Result<usize>,
+    mut emit: impl FnMut(&str),
+) -> io::Result<u8> {
+    let Some(account) = resolve_account(user)? else {
+        return Err(io::Error::other(format!("no account named {user}")));
+    };
+    match list_members(group) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => create_group(group)?,
+        Err(e) => return Err(e),
+    }
+    if !list_members(group)?.iter().any(|m| m == &account) {
+        add_member(&account, group)?;
+        emit(&format!("{user} is in the {group} group"));
+    }
+    start_engine()?;
+    match grant_acl(group) {
+        Ok(_) => {
+            emit(&format!("{user} can use Kiri now"));
+            Ok(0)
+        }
+        Err(e) if crate::daemon::access::unsupported(&e) => {
+            emit(&format!("{user} can use Kiri after logging out and back in (this system keeps no access lists)"));
+            Ok(SIGN_IN_AGAIN)
+        }
+        Err(e) if crate::daemon::access::acl_too_large(&e) => {
+            emit(&format!("{user} can use Kiri after logging out and back in (the {group} group has too many members for the socket access list)"));
+            Ok(SIGN_IN_AGAIN)
+        }
+        Err(e) => Err(io::Error::other(format!("couldn't give {user} the socket: {e}"))),
+    }
+}
+
 pub fn run(args: &[String]) -> io::Result<u8> {
     let (restart, args) = match args {
         [flag, rest @ ..] if flag == "--restart" => (true, rest),
@@ -95,37 +137,20 @@ pub fn run(args: &[String]) -> io::Result<u8> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other(format!("needs root: sudo kiri host-access {}{user}", if restart { "--restart " } else { "" })));
     }
-    let Some(account) = crate::daemon::access::account_name(user)? else {
-        return Err(io::Error::other(format!("no account named {user}")));
-    };
-    match crate::daemon::access::members(GROUP) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    run_with(
+        user,
+        GROUP,
+        crate::daemon::access::account_name,
+        crate::daemon::access::members,
+        |group| {
             let groupadd = find_tool("groupadd").ok_or_else(|| io::Error::other("groupadd not found in system directories"))?;
-            must_output(tool_cmd(&groupadd).args(["--system", GROUP]), "groupadd")?;
-        }
-        Err(e) => return Err(e),
-    }
-    if !crate::daemon::access::members(GROUP)?.iter().any(|m| m == &account) {
-        add_member_with(&account, GROUP, find_tool("usermod").as_deref(), find_tool("gpasswd").as_deref())?;
-        println!("{account} is in the {GROUP} group");
-    }
-    engine(restart)?;
-    match crate::daemon::access::grant(Path::new(SOCKET), GROUP) {
-        Ok(_) => {
-            println!("{account} can use Kiri now");
-            Ok(0)
-        }
-        Err(e) if crate::daemon::access::unsupported(&e) => {
-            println!("{account} can use Kiri after logging out and back in (this system keeps no access lists)");
-            Ok(SIGN_IN_AGAIN)
-        }
-        Err(e) if crate::daemon::access::acl_too_large(&e) => {
-            println!("{account} can use Kiri after logging out and back in (the {GROUP} group has too many members for the socket access list)");
-            Ok(SIGN_IN_AGAIN)
-        }
-        Err(e) => Err(io::Error::other(format!("couldn't give {account} the socket: {e}"))),
-    }
+            must_output(tool_cmd(&groupadd).args(["--system", group]), "groupadd")
+        },
+        |member, group| add_member_with(member, group, find_tool("usermod").as_deref(), find_tool("gpasswd").as_deref()),
+        || engine(restart),
+        |group| crate::daemon::access::grant(Path::new(SOCKET), group),
+        |line| println!("{line}"),
+    )
 }
 
 /// The engine running and answering on its socket; with `restart`, a
@@ -259,5 +284,67 @@ mod tests {
         assert!(err.contains("read-only /etc/group") && err.contains("cannot lock /etc/group"), "missing diagnostics: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hostaccess_prints_requested_user_while_adding_canonical_name() {
+        use std::sync::Mutex;
+
+        let added = Mutex::new(Vec::<(String, String)>::new());
+        let mut lines = Vec::<String>::new();
+        let status = run_with(
+            "KCanon349",
+            "kiri",
+            |_| Ok(Some("kcanon349@corp.example".into())),
+            |_| Ok(vec![]),
+            |_| Ok(()),
+            |member, group| {
+                added.lock().unwrap().push((member.to_owned(), group.to_owned()));
+                Ok(())
+            },
+            || Ok(()),
+            |_| Ok(1),
+            |line| lines.push(line.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(status, 0);
+        assert_eq!(*added.lock().unwrap(), vec![("kcanon349@corp.example".into(), "kiri".into())]);
+        assert_eq!(lines, vec!["KCanon349 is in the kiri group", "KCanon349 can use Kiri now"]);
+
+        for (err_no, expected_substr) in [(libc::EOPNOTSUPP, "keeps no access lists"), (libc::ENOSPC, "too many members")] {
+            let mut out = Vec::<String>::new();
+            let code = run_with(
+                "KCanon349",
+                "kiri",
+                |_| Ok(Some("kcanon349@corp.example".into())),
+                |_| Ok(vec!["kcanon349@corp.example".into()]),
+                |_| Ok(()),
+                |_, _| panic!("already a member"),
+                || Ok(()),
+                |_| Err(io::Error::from_raw_os_error(err_no)),
+                |line| out.push(line.to_owned()),
+            )
+            .unwrap();
+            assert_eq!(code, SIGN_IN_AGAIN);
+            assert_eq!(out.len(), 1);
+            assert!(out[0].starts_with("KCanon349 can use Kiri after logging out"), "got: {}", out[0]);
+            assert!(out[0].contains(expected_substr), "got: {}", out[0]);
+            assert!(!out[0].contains("kcanon349@corp.example"), "must not print resolved record: {}", out[0]);
+        }
+
+        let err = run_with(
+            "KCanon349",
+            "kiri",
+            |_| Ok(Some("kcanon349@corp.example".into())),
+            |_| Ok(vec!["kcanon349@corp.example".into()]),
+            |_| Ok(()),
+            |_, _| Ok(()),
+            || Ok(()),
+            |_| Err(io::Error::other("boom")),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("KCanon349") && !err.contains("kcanon349@corp.example"), "got: {err}");
     }
 }
