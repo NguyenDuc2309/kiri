@@ -78,7 +78,7 @@ fn find_getent() -> Option<&'static Path> {
 }
 
 /// An account: its name, uid and primary group.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Account {
     name: CString,
     uid: u32,
@@ -97,7 +97,7 @@ impl Account {
 }
 
 /// A group: its name, gid and explicit member names.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Group {
     name: CString,
     gid: u32,
@@ -124,6 +124,26 @@ impl Group {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LookupResult<T> {
+    /// Entry found.
+    Found(T),
+    /// Definitely absent (no `getent` binary and local miss, or invalid/mismatched key).
+    NotFound,
+    /// `getent` returned exit 2: either absent or NSS directory temporarily unavailable.
+    UnavailableOrNotFound,
+}
+
+fn local_account_by_name(name: &CStr) -> io::Result<Option<Account>> {
+    // SAFETY: getpwnam_r with a valid C string, a passwd record and a buffer of the stated size.
+    Ok(unsafe { nss(|rec, buf, len, out| libc::getpwnam_r(name.as_ptr(), rec, buf, len, out)) }?.and_then(|a| Account::from_rec(&a)))
+}
+
+fn local_group_by_name(name: &CStr) -> io::Result<Option<Group>> {
+    // SAFETY: getgrnam_r with a valid C string, a group record and a buffer of the stated size.
+    Ok(unsafe { nss(|rec, buf, len, out| libc::getgrnam_r(name.as_ptr(), rec, buf, len, out)) }?.and_then(|g| Group::from_rec(&g)))
+}
+
 fn account_by_uid(uid: u32) -> io::Result<Option<Account>> {
     // SAFETY: getpwuid_r with a passwd record and a buffer of the stated size.
     match unsafe { nss(|rec, buf, len, out| libc::getpwuid_r(uid, rec, buf, len, out)) }? {
@@ -133,15 +153,39 @@ fn account_by_uid(uid: u32) -> io::Result<Option<Account>> {
 }
 
 fn account_by_name(name: &CStr) -> io::Result<Option<Account>> {
-    // SAFETY: getpwnam_r with a valid C string, a passwd record and a buffer of the stated size.
-    match unsafe { nss(|rec, buf, len, out| libc::getpwnam_r(name.as_ptr(), rec, buf, len, out)) }? {
-        Some(a) => Ok(Account::from_rec(&a)),
-        None => Ok(getent_account(name.to_bytes())?.filter(|a| a.name.as_c_str() == name)),
+    match local_account_by_name(name)? {
+        Some(a) => Ok(Some(a)),
+        None => Ok(getent_account(name.to_bytes())?.and_then(|a| match_account_name(name.to_bytes(), a))),
     }
 }
 
 fn valid_key(key: &[u8]) -> bool {
     !key.is_empty() && key[0] != b'-' && !key.iter().any(|&b| matches!(b, b':' | b'\n' | b'\r' | 0))
+}
+
+/// Whether `strtoul(key, &end, 10)` in the C locale would consume all of `key`
+/// as a numeric id rather than a name (`"0"`, `"+0"`, `" 0"`, `" -0"`, etc.).
+fn is_numeric_key(key: &[u8]) -> bool {
+    let Some(start) = key.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)) else {
+        return false;
+    };
+    let rest = &key[start..];
+    let digits = rest.strip_prefix(b"+").or_else(|| rest.strip_prefix(b"-")).unwrap_or(rest);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+fn match_account_name(query: &[u8], account: Account) -> Option<Account> {
+    if is_numeric_key(query) && account.name.as_bytes() != query {
+        return None;
+    }
+    Some(account)
+}
+
+fn match_group_name(query: &[u8], group: Group) -> Option<Group> {
+    if is_numeric_key(query) && group.name.as_bytes() != query {
+        return None;
+    }
+    Some(group)
 }
 
 fn single_line(text: &[u8]) -> Option<&[u8]> {
@@ -158,6 +202,22 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
         return None;
     }
     std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// Parses a GID token from `getent initgroups`: glibc formats `gid_t` with
+/// signed `PRId32`, so GIDs >= 2^31 appear as negative decimal integers.
+fn parse_initgroups_gid(bytes: &[u8]) -> Option<u32> {
+    if let Some(rest) = bytes.strip_prefix(b"-") {
+        if rest.is_empty() || !rest.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let v: i32 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        if v >= 0 {
+            return None;
+        }
+        return Some(v as u32);
+    }
+    parse_u32(bytes)
 }
 
 enum GetentRaw {
@@ -288,10 +348,6 @@ fn exec_getent(program: &Path, args: &[&OsStr], timeout: Duration, max_bytes: us
 
 /// Runs `program -- <db> <key>`, returning `Ok(Some(stdout))` on exit 0,
 /// `Ok(None)` on exit 2 (no such key) or missing binary, and `Err` otherwise.
-fn run_getent(program: &Path, db: &str, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-    run_getent_with_limits(program, db, key, GETENT_TIMEOUT, GETENT_MAX_STDOUT)
-}
-
 fn run_getent_with_limits(program: &Path, db: &str, key: &[u8], timeout: Duration, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
     if !valid_key(key) {
         return Ok(None);
@@ -328,17 +384,44 @@ fn getent_account_with_limits(program: &Path, key: &[u8], timeout: Duration, max
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent passwd output for {}", String::from_utf8_lossy(key))))
 }
 
-/// A group resolved through NSS when not in /etc/group.
-fn getent_group(key: &[u8]) -> io::Result<Option<Group>> {
+/// A group resolved through NSS (`getent group`), returning `Ok(None)` only
+/// when no `getent` binary exists so the caller can fall back to `/etc/group`.
+fn getent_group_lookup(key: &[u8]) -> io::Result<Option<LookupResult<Group>>> {
     let Some(program) = find_getent() else { return Ok(None) };
-    getent_group_with(program, key)
+    getent_group_lookup_with(program, key)
 }
 
+fn getent_group_lookup_with(program: &Path, key: &[u8]) -> io::Result<Option<LookupResult<Group>>> {
+    if !valid_key(key) {
+        return Ok(Some(LookupResult::NotFound));
+    }
+    let args = [OsStr::new("group"), OsStr::from_bytes(key)];
+    match exec_getent(program, &args, GETENT_TIMEOUT, GETENT_MAX_STDOUT)? {
+        GetentRaw::NoBinary => Ok(None),
+        GetentRaw::Ran(status, stdout) => match status.code() {
+            Some(0) => group_line(&stdout)
+                .map(|g| Some(LookupResult::Found(g)))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent group output for {}", String::from_utf8_lossy(key)))),
+            Some(2) => Ok(Some(LookupResult::UnavailableOrNotFound)),
+            _ => Err(io::Error::other(format!("getent group {}: {status}", String::from_utf8_lossy(key)))),
+        },
+    }
+}
+
+#[cfg(test)]
+fn getent_group(key: &[u8]) -> io::Result<Option<Group>> {
+    match getent_group_lookup(key)? {
+        Some(LookupResult::Found(g)) => Ok(Some(g)),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
 fn getent_group_with(program: &Path, key: &[u8]) -> io::Result<Option<Group>> {
-    let Some(stdout) = run_getent(program, "group", key)? else { return Ok(None) };
-    group_line(&stdout)
-        .map(Some)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unexpected getent group output for {}", String::from_utf8_lossy(key))))
+    match getent_group_lookup_with(program, key)? {
+        Some(LookupResult::Found(g)) => Ok(Some(g)),
+        _ => Ok(None),
+    }
 }
 
 /// Checks supplementary group memberships through NSS (`getent initgroups`),
@@ -414,18 +497,35 @@ fn initgroups_line(text: &[u8], expected_user: &[u8]) -> Option<Vec<u32>> {
     }
     let mut gids = Vec::new();
     for tok in rest.split(|b| matches!(b, b' ' | b'\t')).filter(|s| !s.is_empty()) {
-        gids.push(parse_u32(tok)?);
+        gids.push(parse_initgroups_gid(tok)?);
     }
     Some(gids)
 }
 
+fn group_by_name_with(
+    name: &CStr,
+    getent_lookup: impl Fn(&[u8]) -> io::Result<Option<LookupResult<Group>>>,
+    local_lookup: impl Fn(&CStr) -> io::Result<Option<Group>>,
+) -> io::Result<LookupResult<Group>> {
+    // Prefer `getent group` when available so /etc/nsswitch.conf ordering and
+    // `[SUCCESS=merge]` are honored. Fall back to static `getgrnam_r` only
+    // when no `getent` binary exists.
+    match getent_lookup(name.to_bytes())? {
+        Some(LookupResult::Found(g)) => Ok(match_group_name(name.to_bytes(), g).map_or(LookupResult::NotFound, LookupResult::Found)),
+        Some(other) => Ok(other),
+        None => Ok(local_lookup(name)?.map_or(LookupResult::NotFound, LookupResult::Found)),
+    }
+}
+
+fn group_by_name_detailed(name: &CStr) -> io::Result<LookupResult<Group>> {
+    group_by_name_with(name, getent_group_lookup, local_group_by_name)
+}
+
 fn group_by_name(name: &CStr) -> io::Result<Group> {
-    // SAFETY: getgrnam_r with a valid C string, a group record and a buffer of the stated size.
-    let group = match unsafe { nss(|rec, buf, len, out| libc::getgrnam_r(name.as_ptr(), rec, buf, len, out)) }? {
-        Some(g) => Group::from_rec(&g),
-        None => getent_group(name.to_bytes())?.filter(|g| g.name.as_c_str() == name),
-    };
-    group.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no group {}", name.to_string_lossy())))
+    match group_by_name_detailed(name)? {
+        LookupResult::Found(g) => Ok(g),
+        LookupResult::NotFound | LookupResult::UnavailableOrNotFound => Err(io::Error::new(io::ErrorKind::NotFound, format!("no group {}", name.to_string_lossy()))),
+    }
 }
 
 fn c_name(s: &str) -> io::Result<CString> {
@@ -449,8 +549,23 @@ pub fn group_gid(group: &OsStr) -> io::Result<u32> {
 }
 
 /// A user's numeric id, if the account exists.
+#[cfg(test)]
 pub fn uid(user: &str) -> Option<u32> {
     Some(account_by_name(&c_name(user).ok()?).ok()??.uid)
+}
+
+/// Resolves an account by name and returns its canonical name from the user
+/// database (which may differ in case or domain suffix for directory accounts).
+pub fn account_name(user: &str) -> io::Result<Option<String>> {
+    let Ok(name) = c_name(user) else { return Ok(None) };
+    match account_by_name(&name)? {
+        Some(a) => a
+            .name
+            .into_string()
+            .map(Some)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("non-UTF-8 account name for {user}"))),
+        None => Ok(None),
+    }
 }
 
 /// The uids of the names in a group record, sorted. A name with no account
@@ -1318,6 +1433,101 @@ mod tests {
         let err = getent_account_with_limits(&prog, b"flood", Duration::from_secs(3), 256).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_by_name_prefers_getent_for_nss_merge_and_override() {
+        let local = Group { name: c"kiri".to_owned(), gid: 100, members: vec![c"local".to_owned()] };
+        let merged = Group { name: c"kiri".to_owned(), gid: 100, members: vec![c"local".to_owned(), c"diralice".to_owned()] };
+        let overridden = Group { name: c"kiri".to_owned(), gid: 200, members: vec![c"sssonly".to_owned()] };
+
+        // Merged local + NSS members are preserved when getent is available.
+        let g = group_by_name_with(c"kiri", |_| Ok(Some(LookupResult::Found(merged.clone()))), |_| Ok(Some(local.clone()))).unwrap();
+        assert_eq!(g, LookupResult::Found(merged));
+
+        // NSS-first GID and membership override /etc/group when getent is available.
+        let g = group_by_name_with(c"kiri", |_| Ok(Some(LookupResult::Found(overridden.clone()))), |_| Ok(Some(local.clone()))).unwrap();
+        assert_eq!(g, LookupResult::Found(overridden));
+
+        // Exit 2 from getent does not silently override NSS policy with /etc/group.
+        let g = group_by_name_with(c"kiri", |_| Ok(Some(LookupResult::UnavailableOrNotFound)), |_| Ok(Some(local.clone()))).unwrap();
+        assert_eq!(g, LookupResult::UnavailableOrNotFound);
+
+        // Only when no getent binary exists do we fall back to static getgrnam_r.
+        let g = group_by_name_with(c"kiri", |_| Ok(None), |_| Ok(Some(local.clone()))).unwrap();
+        assert_eq!(g, LookupResult::Found(local));
+    }
+
+    #[test]
+    fn canonical_directory_names_accepted_while_numeric_keys_require_exact_match() {
+        let dir = make_temp_dir("canon");
+        let prog = write_test_script(
+            &dir,
+            "fake-getent",
+            "#!/bin/sh\n\
+             [ \"$1\" = \"--\" ] || exit 9\n\
+             shift\n\
+             case \"$1:$2\" in\n\
+               passwd:alice|passwd:Alice@corp.example) echo 'alice@corp.example:x:5001:5001::/home/alice:/bin/sh'; exit 0 ;;\n\
+               passwd:0|'passwd:+0'|'passwd: 0'|'passwd: -0') echo 'root:x:0:0:root:/root:/bin/sh'; exit 0 ;;\n\
+               group:DevOps) echo 'devops@corp.example:x:65300:alice@corp.example'; exit 0 ;;\n\
+               group:0|'group:+0'|'group: 0') echo 'root:x:0:'; exit 0 ;;\n\
+               *) exit 2 ;;\n\
+             esac\n",
+        );
+
+        let canonical = Account { name: c"alice@corp.example".to_owned(), uid: 5001, gid: 5001 };
+        for query in [&b"alice"[..], b"Alice@corp.example"] {
+            let got = getent_account_with(&prog, query).unwrap().and_then(|a| match_account_name(query, a));
+            assert_eq!(got, Some(canonical.clone()), "{query:?}");
+        }
+        for numeric in [&b"0"[..], b"+0", b" 0", b" -0"] {
+            assert!(is_numeric_key(numeric), "{numeric:?}");
+            let got = getent_account_with(&prog, numeric).unwrap().and_then(|a| match_account_name(numeric, a));
+            assert_eq!(got, None, "{numeric:?} must not resolve to root");
+        }
+        assert!(is_numeric_key(b"\t+42"));
+        assert!(!is_numeric_key(b"123alice"));
+        assert!(!is_numeric_key(b"   "));
+
+        let devops = Group { name: c"devops@corp.example".to_owned(), gid: 65300, members: vec![c"alice@corp.example".to_owned()] };
+        let g = group_by_name_with(c"DevOps", |k| getent_group_lookup_with(&prog, k), |_| Ok(None)).unwrap();
+        assert_eq!(g, LookupResult::Found(devops));
+        for numeric in [c"0", c"+0", c" 0"] {
+            let g = group_by_name_with(numeric, |k| getent_group_lookup_with(&prog, k), |_| Ok(None)).unwrap();
+            assert_eq!(g, LookupResult::NotFound, "{numeric:?} must not resolve to group root");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn initgroups_parses_signed_high_gids_and_rejects_malformed() {
+        assert_eq!(
+            initgroups_line(b"alice -2147483648 -1 -1000 998\n", b"alice"),
+            Some(vec![2_147_483_648, u32::MAX, 4_294_966_296, 998])
+        );
+        assert_eq!(initgroups_line(b"alice 2147483648 998\n", b"alice"), Some(vec![2_147_483_648, 998]));
+        for bad in [&b"alice -0\n"[..], b"alice -\n", b"alice --1\n", b"alice -2147483649\n", b"alice +998\n"] {
+            assert_eq!(initgroups_line(bad, b"alice"), None, "{bad:?}");
+        }
+
+        let dir = make_temp_dir("highgid");
+        let prog = write_test_script(
+            &dir,
+            "fake-getent",
+            "#!/bin/sh\n\
+             [ \"$1\" = \"--\" ] || exit 9\n\
+             shift\n\
+             case \"$1:$2\" in\n\
+               initgroups:alice) echo 'alice -2147483648 -1000 998'; exit 0 ;;\n\
+               *) exit 2 ;;\n\
+             esac\n",
+        );
+        assert!(initgroups_has_with(&prog, c"alice", 998).unwrap());
+        assert!(initgroups_has_with(&prog, c"alice", 2_147_483_648).unwrap());
+        assert!(!initgroups_has_with(&prog, c"alice", 1234).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

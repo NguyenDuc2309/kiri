@@ -95,9 +95,9 @@ pub fn run(args: &[String]) -> io::Result<u8> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other(format!("needs root: sudo kiri host-access {}{user}", if restart { "--restart " } else { "" })));
     }
-    if crate::daemon::access::uid(user).is_none() {
+    let Some(account) = crate::daemon::access::account_name(user)? else {
         return Err(io::Error::other(format!("no account named {user}")));
-    }
+    };
     match crate::daemon::access::members(GROUP) {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -106,21 +106,21 @@ pub fn run(args: &[String]) -> io::Result<u8> {
         }
         Err(e) => return Err(e),
     }
-    if !crate::daemon::access::members(GROUP)?.iter().any(|m| m == user) {
-        add_member_with(user, GROUP, find_tool("usermod").as_deref(), find_tool("gpasswd").as_deref())?;
-        println!("{user} is in the {GROUP} group");
+    if !crate::daemon::access::members(GROUP)?.iter().any(|m| m == &account) {
+        add_member_with(&account, GROUP, find_tool("usermod").as_deref(), find_tool("gpasswd").as_deref())?;
+        println!("{account} is in the {GROUP} group");
     }
     engine(restart)?;
     match crate::daemon::access::grant(Path::new(SOCKET), GROUP) {
         Ok(_) => {
-            println!("{user} can use Kiri now");
+            println!("{account} can use Kiri now");
             Ok(0)
         }
         Err(e) if crate::daemon::access::unsupported(&e) => {
-            println!("{user} can use Kiri after logging out and back in (this system keeps no access lists)");
+            println!("{account} can use Kiri after logging out and back in (this system keeps no access lists)");
             Ok(SIGN_IN_AGAIN)
         }
-        Err(e) => Err(io::Error::other(format!("couldn't give {user} the socket: {e}"))),
+        Err(e) => Err(io::Error::other(format!("couldn't give {account} the socket: {e}"))),
     }
 }
 
