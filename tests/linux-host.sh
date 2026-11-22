@@ -405,6 +405,83 @@ t fwdrop-nft-warning-gone "gone" "docker info --format '{{json .Warnings}}' | gr
 # takes Kiri's own table: it is built again, or containers had no NAT.
 t fwdrop-flush-rebuilt "Example Domain" "nft flush ruleset; sleep 1; docker run --rm alpine wget -qO- -T 10 http://example.com"
 t fwdrop-cleanup "ok" "pkill -f '[h]ttp.server 8080'; ip netns del vm; ip link del virbr0; echo ok"
+# Directory accounts and NSS groups outside /etc/passwd and /etc/group (#349):
+# the static engine falls back to getent, admits members of the configured
+# group (local, directory, initgroups-only, and NSS-only groups), refuses
+# non-members and unknown uids, and revokes removed accounts.
+$D exec -i "$N" sh -c 'cat > /access-test.sh' <<'SH'
+#!/bin/sh
+set -u
+had_getent=1
+[ -e /usr/bin/getent ] || { had_getent=0; : > /usr/bin/getent; }
+out=$(unshare --mount --propagation private --net --fork sh -c '
+  set -u
+  mount -t tmpfs t /var/lib/kiri && mount -t tmpfs t /root && mount -t tmpfs t /dev/shm && ip link set lo up
+  mkdir -p /dev/shm/acc && chmod 755 /dev/shm/acc
+  cp /etc/passwd /dev/shm/acc/passwd && cp /etc/group /dev/shm/acc/group
+  echo "klocal349:x:21001:21001::/:/sbin/nologin" >> /dev/shm/acc/passwd
+  echo "kgrp349:x:21100:klocal349,kdir349" >> /dev/shm/acc/group
+  mount --bind /dev/shm/acc/passwd /etc/passwd
+  mount --bind /dev/shm/acc/group /etc/group
+  cat > /dev/shm/acc/getent <<"GE"
+#!/bin/sh
+[ "$1" = "--" ] && shift
+case "$1:$2" in
+  passwd:kdir349|passwd:21002) echo "kdir349:x:21002:21002::/:/bin/sh"; exit 0 ;;
+  passwd:kinit349|passwd:21003) echo "kinit349:x:21003:21003::/:/bin/sh"; exit 0 ;;
+  passwd:kout349|passwd:21004) echo "kout349:x:21004:21004::/:/bin/sh"; exit 0 ;;
+  group:knssgrp349) echo "knssgrp349:x:21200:klocal349,kdir349"; exit 0 ;;
+  initgroups:kinit349) echo "kinit349 21100"; exit 0 ;;
+  initgroups:kdir349|initgroups:kout349|initgroups:klocal349) echo "$2"; exit 0 ;;
+  *) exit 2 ;;
+esac
+GE
+  chmod 755 /dev/shm/acc/getent
+  mount --bind /dev/shm/acc/getent /usr/bin/getent
+  ping() {
+    sock=$1; uid=$2; gid=$3; grp=${4:-}
+    if [ -n "$grp" ]; then
+      code=$(setpriv --reuid="$uid" --regid="$gid" --groups="$grp" curl -s -m 3 -o /dev/null -w "%{http_code}" --unix-socket "$sock" http://d/_ping 2>/dev/null)
+    else
+      code=$(setpriv --reuid="$uid" --regid="$gid" --clear-groups curl -s -m 3 -o /dev/null -w "%{http_code}" --unix-socket "$sock" http://d/_ping 2>/dev/null)
+    fi
+    echo "${code:-000}"
+  }
+  S1=/dev/shm/acc/loc.sock
+  mkdir -p /dev/shm/acc/h1
+  HOME=/dev/shm/acc/h1 KIRI_SOCKET=$S1 KIRI_SOCKET_GROUP=kgrp349 /opt/kiri/kiri daemon >/dev/shm/acc/d1.log 2>&1 &
+  P1=$!
+  for i in $(seq 80); do [ -S "$S1" ] && [ "$(ping "$S1" 0 0)" = 200 ] && break; sleep 0.2; done
+  r_local=$(ping "$S1" 21001 21001)
+  r_dir=$(ping "$S1" 21002 21002)
+  r_init=$(ping "$S1" 21003 21003 21100)
+  r_out=$(ping "$S1" 21004 21004 21100)
+  r_unk=$(ping "$S1" 21099 21099 21100)
+  grep -v "^kgrp349:" /etc/group > /dev/shm/acc/group.new
+  echo "kgrp349:x:21100:klocal349" >> /dev/shm/acc/group.new
+  cat /dev/shm/acc/group.new > /etc/group
+  sleep 3
+  r_rev=$(ping "$S1" 21002 21002 21100)
+  kill "$P1" 2>/dev/null; wait "$P1" 2>/dev/null
+  S2=/dev/shm/acc/nss.sock
+  mkdir -p /dev/shm/acc/h2
+  HOME=/dev/shm/acc/h2 KIRI_SOCKET=$S2 KIRI_SOCKET_GROUP=knssgrp349 /opt/kiri/kiri daemon >/dev/shm/acc/d2.log 2>&1 &
+  P2=$!
+  for i in $(seq 40); do kill -0 "$P2" 2>/dev/null || break; [ -S "$S2" ] && [ "$(ping "$S2" 0 0)" = 200 ] && break; sleep 0.2; done
+  if [ -S "$S2" ] && [ "$(ping "$S2" 0 0)" = 200 ]; then
+    r_nl=$(ping "$S2" 21001 21001)
+    r_nd=$(ping "$S2" 21002 21002)
+    r_no=$(ping "$S2" 21004 21004 21200)
+  else
+    r_nl=down; r_nd=down; r_no=down
+  fi
+  kill "$P2" 2>/dev/null; wait "$P2" 2>/dev/null
+  echo "local=$r_local dir=$r_dir init=$r_init out=$r_out unk=$r_unk rev=$r_rev nss-local=$r_nl nss-dir=$r_nd nss-out=$r_no"
+')
+[ "$had_getent" = 0 ] && rm -f /usr/bin/getent
+echo "$out"
+SH
+t access-directory-accounts "local=200 dir=200 init=200 out=000 unk=000 rev=000 nss-local=200 nss-dir=200 nss-out=000" "apk add -q util-linux util-linux-misc iproute2 >/dev/null 2>&1; sh /access-test.sh"
 $D rm -f "$N" >/dev/null
 # An engine in a user namespace (nested Docker, Sysbox, Coder, CI; #597),
 # where the kernel refuses mknod of a device: an image layer with a
